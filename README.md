@@ -54,8 +54,18 @@ git·SVN 모두 지원합니다. 서버(git 원격·SVN)에 아무것도 올리�
   프로젝트 안의 `.claude/skills/`에는 넣지 마세요. 섹션 구조의 일부가 되어 비교를 흐립니다.
 - **Claude 앱**: 스킬 화면에서 `SKILL.md`를 업로드합니다.
 
-### 3. 기록 훅
-섹션마다 `init --install-hooks`를 실행하면 그 섹션의 `.claude/settings.local.json`(개인 설정)에 Claude Code 훅이 등록됩니다. 훅은 `start`~`end` 사이에만 기록하고, 그 밖의 작업에는 영향이 없습니다.
+### 3. 기록 훅 — 가장 쉬운 방법 (`mc`)
+섹션 폴더들을 준비한 뒤 명령 세 줄이면 됩니다.
+```bash
+python tools/mes-compare/mc.py install          # mc 명령 등록 (한 번만)
+mc setup D:/compare/섹션1=새구조 D:/compare/섹션2=현재 D:/compare/섹션3=구조없음
+mc dash                                          # 대시보드를 켜고 브라우저까지 엶
+```
+- `mc setup` 이 섹션마다 한 번에 하는 일: 기록 폴더 연결(기본 = 섹션들의 공통 상위/`mes-compare-data`), 구조 이름 저장, 기록 훅(파일·스킬·에이전트·토큰), **자동 시작·종료 훅**(작업을 그냥 시키면 실행이 자동으로 시작·종료되어 `mc start`/`mc end` 불필요), SVN·DB 접속 차단 훅(`--no-guard` 로 끔). 결과를 섹션별 ✓/✗ 로 보여 줍니다.
+- `mc check`: 연결한 섹션마다 훅·기록 폴더·구조 이름 점검, 진행 중 실행·대시보드 상태.
+- 훅은 섹션의 `.claude/settings.local.json`(개인 설정)에 들어가고, 이전 파일은 `.json.bak` 으로 남습니다. 섹션에서 **새로 여는** 세션부터 적용됩니다.
+
+직접 하려면 섹션마다 `init --install-hooks`를 실행합니다 (기록 훅만 등록, 자동 시작·종료는 없음).
 
 ---
 
@@ -105,7 +115,9 @@ python $T reset            # 다음 작업 전 코드 되돌리기 (미리보기
 
 ### 판정과 보기
 ```bash
-python $T serve            # http://localhost:8765 실시간 대시보드 (판정 입력 가능)
+python $T serve            # http://localhost:8765 실시간 대시보드 (판정 입력 가능) — mc dash 와 같음
+# 대시보드: 구조별 비교(기준 구조 값 포함) · 토큰은 어디에 쓰였나(접힘: 기본 문맥·이전 작업 이월·파일 읽기·명령 등 용도별, 실행별 상위 항목)
+#           · 작업 흐름 3D 연결(실행마다 읽은 파일·도구 호출이 둥근 덩어리, 확대·회전) · 에이전트·스킬 설명(접힘)
 python $T judge --run T01:기본#1 --final 불합격 --fail-reason "재고 원복 누락" --by 홍길동
 python $T build --out 구조비교_1차.html --label "1차"    # 공유용 단일 HTML
 ```
