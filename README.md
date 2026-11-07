@@ -147,7 +147,7 @@ python $T build --out 구조비교_1차.html --label "1차"    # 공유용 단�
 - 같은 작업 ID를 두 구조가 모두 실행한 경우만 비교합니다.
 - 합격률: 작업마다 판정된 실행의 합격 비율 → 작업 평균 (반복 실행 포함). 첫 시도 합격률은 재작업 0회 합격.
 - 토큰·시간: 양쪽 모두 합격한 실행이 있고 그 지표가 측정된 작업만, 합격 실행 평균으로 비교. 토큰과 시간은 따로 판정.
-- 토큰 = 실행 시작 이후 대화 기록(transcript) usage 합계 (input + output + cache_creation + cache_read). 기준을 바꾸려면 코드의 `TOKEN_FIELDS`.
+- 토큰 = 실행 시작 이후, 실행을 시작한 세션과 하위 에이전트의 대화 기록(transcript) usage 합계 (input + output + cache_creation + cache_read). 응답 하나가 여러 줄로 기록돼도 `message.id`로 한 번만 셉니다. `end`가 마지막 턴까지 직접 계산합니다. 기준을 바꾸려면 코드의 `TOKEN_FIELDS`.
 - 시간 = AI 작업 시작~종료 (판정 대기 시간 제외).
 
 ---

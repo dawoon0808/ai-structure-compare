@@ -61,20 +61,33 @@ def parse_ts(s):
         return None
 
 
-def git(args, cwd):
+def run_cmd(cmd, cwd, timeout, encoding=None):
+    """명령 실행 → (성공 여부, stdout, stderr). git 은 UTF-8, svn 은 시스템 인코딩으로 읽는다."""
     try:
-        r = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True, text=True, timeout=10)
-        return r.stdout.rstrip() if r.returncode == 0 else None
-    except Exception:
-        return None
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+                           encoding=encoding, errors="replace")
+        return r.returncode == 0, r.stdout, r.stderr.strip()
+    except Exception as e:
+        return False, "", str(e)
+
+
+def git_run(args, cwd, timeout=10):
+    # core.quotePath=false: 한글 경로를 "\355\225\234" 처럼 이스케이프하지 않고 그대로 받는다
+    return run_cmd(["git", "-c", "core.quotePath=false"] + args, cwd, timeout, "utf-8")
+
+
+def git(args, cwd):
+    ok, out, _ = git_run(args, cwd)
+    return out.rstrip() if ok else None
+
+
+def svn_run(args, cwd, timeout=20):
+    return run_cmd(["svn"] + args, cwd, timeout)
 
 
 def svn(args, cwd):
-    try:
-        r = subprocess.run(["svn"] + args, cwd=str(cwd), capture_output=True, text=True, timeout=20)
-        return r.stdout.rstrip() if r.returncode == 0 else None
-    except Exception:
-        return None
+    ok, out, _ = svn_run(args, cwd)
+    return out.rstrip() if ok else None
 
 
 def vcs(cwd):
@@ -252,29 +265,101 @@ def code_base(section):
     tree = git(["ls-tree", "-r", "HEAD"], section) or ""
     lines = [l for l in tree.splitlines() if "\t" in l and not is_ai_path(l.split("\t", 1)[1])]
     code_fp = hashlib.sha1("\n".join(lines).encode()).hexdigest()[:10] if lines else ""
-    st = git(["status", "--porcelain"], section) or ""
-    dirty = [l[3:] for l in st.splitlines() if l[3:] and not is_ai_path(l[3:])]
+    dirty = sorted({p for _, p, _ in git_changes(section)[1] if not is_ai_path(p)})
     return {"vcs": "git" if head else "", "commit": (head or "")[:12], "code_fp": code_fp, "dirty": dirty[:20], "dirty_n": len(dirty)}
 
 
+def git_changes(section):
+    """git status → (저장소 최상위, [(상태 XY, 경로, 새 파일 여부)]). 경로는 최상위 기준.
+    -z 로 읽어 공백·한글·이름 바꾸기(R old→new)를 정확히 나눈다."""
+    top = git(["rev-parse", "--show-toplevel"], section)
+    ok, out, _ = git_run(["status", "--porcelain", "-z", "--untracked-files=all"], section)
+    res = []
+    if not top or not ok:
+        return top, res
+    items = out.split("\0")
+    i = 0
+    while i < len(items):
+        it = items[i]
+        i += 1
+        if len(it) < 4:
+            continue
+        xy, p = it[:2], it[3:]
+        if xy[0] in "RC" and i < len(items):
+            orig = items[i]
+            i += 1
+            if xy[0] == "R" and orig:
+                res.append((xy, orig, False))  # 이름 바꾸기 전 파일은 원래대로 복구
+            res.append((xy, p, True))
+        else:
+            res.append((xy, p, xy == "??" or "A" in xy))
+    return top, res
+
+
+def delete_new(base, rel, errors):
+    """새로 생긴 파일·폴더 삭제. 폴더면 안의 AI 설정 파일은 남기고 나머지만 지운 뒤 빈 폴더를 정리한다."""
+    f = Path(base) / rel.replace("\\", "/").rstrip("/")
+    try:
+        if f.resolve() == Path(base).resolve():  # 섹션 폴더 자체는 절대 지우지 않는다
+            return
+        if f.is_dir():
+            for q in sorted(f.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+                relq = q.relative_to(base).as_posix()
+                if q.is_file() and not is_ai_path(relq):
+                    q.unlink()
+                elif q.is_dir() and not any(q.iterdir()):
+                    q.rmdir()
+            if not any(f.iterdir()):
+                f.rmdir()
+        elif f.exists():
+            f.unlink()
+        # 지운 뒤 비어 버린 상위 폴더 정리 (base 는 남김)
+        par = f.parent
+        while par != Path(base) and par.is_dir() and not any(par.iterdir()):
+            par.rmdir()
+            par = par.parent
+    except Exception as e:
+        errors.append(f"삭제 실패 {rel}: {e}")
+
+
+def chunks(lst, n=100):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
 def reset_code(section, yes):
-    """AI 설정은 남기고 코드·문서 변경만 되돌린다."""
+    """AI 설정은 남기고 코드·문서 변경만 되돌린다. 실패가 있으면 ValueError."""
     kind = vcs(section)
-    sec = Path(section)
-    revert, delete = [], []
+    base = Path(section)
+    revert, delete, staged_new = [], [], []
     if kind == "git":
-        for l in (git(["status", "--porcelain"], section) or "").splitlines():
-            code, p = l[:2], l[3:].strip().strip('"')
+        top, ch = git_changes(section)
+        if not top:
+            raise ValueError("git 상태를 읽지 못함")
+        base = Path(top)
+        for xy, p, new in ch:
             if not p or is_ai_path(p):
                 continue
-            (delete if code == "??" else revert).append(p)
+            if new:
+                delete.append(p)
+                if xy != "??":
+                    staged_new.append(p)
+            else:
+                revert.append(p)
     elif kind == "svn":
         for c, p in svn_changes(section):
             if is_ai_path(p):
                 continue
-            (delete if c == "?" else revert).append(p)
+            if c == "?":
+                delete.append(p)
+            elif c == "A":  # svn add 된 새 파일: 추가 취소 후 디스크에서도 삭제
+                staged_new.append(p)
+                delete.append(p)
+            else:
+                revert.append(p)
     else:
         raise ValueError("git/SVN 작업 폴더가 아니어서 되돌릴 수 없음")
+    revert, delete, staged_new = (sorted(set(x)) for x in (revert, delete, staged_new))
     print(f"되돌릴 파일 {len(revert)}개 · 지울 새 파일 {len(delete)}개 (AI 설정 파일은 유지)")
     for p in revert[:30]:
         print("  되돌림", p)
@@ -283,18 +368,30 @@ def reset_code(section, yes):
     if not yes:
         print("미리보기입니다. 실제로 하려면 --yes 를 붙이세요.")
         return
-    if revert:
-        if kind == "git":
-            git(["checkout", "--"] + revert, section)
-        else:
-            svn(["revert", "--"] + revert, section)
-    import shutil
+    errors = []
+    if kind == "git":
+        for part in chunks(staged_new):
+            ok, _, err = git_run(["rm", "-r", "--cached", "-q", "--ignore-unmatch", "--"] + part, base, 60)
+            if not ok:
+                errors.append(f"git rm --cached 실패: {err}")
+        for part in chunks(revert):
+            # 인덱스가 아니라 HEAD 에서 복구 (AI 가 스테이징한 변경도 되돌림)
+            ok, _, err = git_run(["checkout", "HEAD", "--"] + part, base, 60)
+            if not ok:
+                errors.append(f"git checkout 실패: {err}")
+    else:
+        for part in chunks(staged_new):
+            ok, _, err = svn_run(["revert", "--depth", "infinity", "--"] + part, base, 60)
+            if not ok:
+                errors.append(f"svn revert 실패: {err}")
+        for part in chunks(revert):
+            ok, _, err = svn_run(["revert", "--"] + part, base, 60)
+            if not ok:
+                errors.append(f"svn revert 실패: {err}")
     for p in delete:
-        f = sec / p.replace("\\", "/")
-        if f.is_dir():
-            shutil.rmtree(f, ignore_errors=True)
-        elif f.exists():
-            f.unlink()
+        delete_new(base, p, errors)
+    if errors:
+        raise ValueError("일부를 되돌리지 못함:\n  " + "\n  ".join(errors))
     print("완료")
 
 
@@ -511,7 +608,10 @@ def render_html(state, live):
 
 # ---------------------------------------------------------------- 훅
 def transcript_tokens(path, since):
-    total = 0
+    """대화 기록의 usage 합계.
+    Claude Code 는 응답 하나를 내용 블록마다 따로 기록하면서 같은 usage 를 반복해 붙이므로
+    message.id(+requestId) 가 같은 기록은 한 번만 센다 (마지막 값 사용)."""
+    by_msg, total = {}, 0
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -522,16 +622,38 @@ def transcript_tokens(path, since):
                 ts = parse_ts(rec.get("timestamp"))
                 if since and ts and ts < since:
                     continue
-                u = (rec.get("message") or {}).get("usage") or rec.get("usage") or {}
-                total += sum(int(u.get(k) or 0) for k in TOKEN_FIELDS)
+                msg = rec.get("message") or {}
+                u = msg.get("usage") or rec.get("usage") or {}
+                n = sum(int(u.get(k) or 0) for k in TOKEN_FIELDS)
+                if not n:
+                    continue
+                mid = msg.get("id")
+                if mid:
+                    by_msg[(mid, rec.get("requestId"))] = n
+                else:
+                    total += n
     except Exception:
         return None
-    return total
+    return total + sum(by_msg.values())
+
+
+def run_tokens(cur):
+    """진행 중 실행의 토큰 = 실행을 시작한 세션의 대화 기록 + 하위 에이전트 대화 기록 (시작 이후)."""
+    since = parse_ts(cur.get("started"))
+    tp = cur.get("transcript_path")
+    main_t = transcript_tokens(tp, since) if tp else None
+    subs = cur.get("subagent_tokens") or {}
+    if not isinstance(subs, dict):  # 이전 형식(누적 정수) 호환
+        subs = {"_": int(subs)}
+    if main_t is None and not subs:
+        return None
+    return (main_t or 0) + sum(subs.values())
 
 
 def run_hook(dir_arg):
     try:
-        payload = json.load(sys.stdin)
+        # Windows 의 기본 stdin 인코딩(cp949)으로 읽으면 한글이 든 입력이 깨지거나 통째로 버려진다
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace"))
     except Exception:
         return
     cwd = Path(payload.get("cwd") or ".")
@@ -546,6 +668,11 @@ def run_hook(dir_arg):
     sec = Path(cur.get("section", "")) if cur.get("section") else None
     sid = payload.get("session_id")
     changed = False
+    # 실행을 처음 기록한 세션의 대화 기록 경로를 남겨 end 가 마지막 턴까지 토큰을 직접 계산하게 한다
+    # (start~end 를 한 턴에 하면 그 사이에 Stop 훅이 오지 않는다)
+    if payload.get("transcript_path") and not cur.get("transcript_path"):
+        cur["transcript_path"] = payload["transcript_path"]
+        changed = True
     if sec and not cur.get("wrong_flag"):
         try:
             cwd.resolve().relative_to(sec)
@@ -575,18 +702,22 @@ def run_hook(dir_arg):
             changed = True
     elif ev_name in ("Stop", "SubagentStop"):
         since = parse_ts(cur.get("started"))
-        if payload.get("agent_transcript_path"):
-            t2 = transcript_tokens(payload["agent_transcript_path"], since)
+        atp = payload.get("agent_transcript_path")
+        if atp:
+            t2 = transcript_tokens(atp, since)
             if t2:
-                cur["subagent_tokens"] = cur.get("subagent_tokens", 0) + t2
+                subs = cur.get("subagent_tokens") or {}
+                if not isinstance(subs, dict):
+                    subs = {"_": int(subs)}
+                subs[atp] = t2  # 같은 하위 에이전트가 다시 멈춰도(이어서 실행) 중복 가산하지 않도록 경로별 최신값
+                cur["subagent_tokens"] = subs
                 changed = True
         if ev_name == "SubagentStop" and stack:
             evs.append({"type": "agent_end", "name": stack.pop()})
             changed = True
-        tp = payload.get("transcript_path")
-        total = transcript_tokens(tp, since) if tp else None
+        total = run_tokens(cur)
         if total is not None:
-            evs.append({"type": "tokens", "total": total + cur.get("subagent_tokens", 0)})
+            evs.append({"type": "tokens", "total": total})
     if changed:
         (d / "current.json").write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
     for ev in evs:
@@ -697,7 +828,23 @@ def serve(d, host, port):
 
 
 # ---------------------------------------------------------------- CLI
+def utf8_output():
+    """출력을 파이프로 받을 때(Claude 가 실행할 때 등) Windows 기본 인코딩(cp949)은 '—' 같은 문자에서
+    UnicodeEncodeError 로 명령이 중간에 멈추므로 UTF-8 로 내보낸다. Windows 콘솔에 직접 출력할 때는 그대로 둔다.
+    (Windows 에서 NUL 로 보낸 출력은 isatty() 가 True 라서 isatty 대신 콘솔 객체인지로 판단한다)"""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            raw = getattr(getattr(s, "buffer", None), "raw", None)
+            if type(raw).__name__ == "_WindowsConsoleIO":
+                s.reconfigure(errors="replace")
+            else:
+                s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main():
+    utf8_output()
     ap = argparse.ArgumentParser(description="AI 사용 구조 비교 도구")
     ap.add_argument("--dir", help="기록 폴더 (기본: MES_DIR 또는 원본 저장소/.mes)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -829,6 +976,10 @@ def main():
         for k in ("checks_passed", "checks_total", "rework", "tokens", "minutes", "note"):
             if getattr(a, k) is not None:
                 ev[k] = getattr(a, k)
+        if a.tokens is None:
+            t = run_tokens(cur)  # 마지막 턴(Stop 훅 전)까지 포함해 직접 계산
+            if t is not None:
+                ev["tokens"] = t
         append(d, ev)
         (d / "current.json").unlink()
         print("AI 작업 종료:", cur["run_id"], "→ 사람 판정 대기")
