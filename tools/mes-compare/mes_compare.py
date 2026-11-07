@@ -42,11 +42,17 @@ FILE_TOOLS = {"Read": "file_path", "Edit": "file_path", "MultiEdit": "file_path"
               "NotebookEdit": "notebook_path"}
 AI_PATHS = (".claude", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", ".mes")
 DATA_POINTER = ".mes-dir"
+PROFILE_MARK = ".mes-profile.json"      # 섹션에 적용한 구조 기록
+PROFILE_BACKUP = ".mes-profile-backup"  # 구조 적용 전 백업
+PROFILE_MANIFEST = "profile.json"       # 구조 묶음의 목록 파일
+INTERNAL_DIR = ".claude/imported"       # 섹션 밖 @import 파일을 묶음 안으로 넣는 위치
+SKIP_DIRS = (".git/", "node_modules/", ".svn/", ".mes")
 IMPORT_DEPTH = 5  # Claude Code 의 @import 최대 깊이
 IMPORT_RE = re.compile(r"(?<![\w`/@])@((?:~|[A-Za-z]:)?[^\s`'\"<>()\[\]{}]+)")
 # setup.json 에서 읽는 분류 (configure 가 채움)
 AI_GLOBS = []    # ai_files: 섹션 안에서 구조(AI 설정)로 볼 파일 패턴. 예: "**/AGENTS.md"
 FIXED_REFS = []  # fixed_refs: 모든 구조에 같아야 하는 참조 문서 패턴 (섹션 밖 절대 경로 가능)
+PROFILE_FILES = set()  # 이 섹션에 apply 로 적용한 구조 파일 (load_profile_mark 가 채움)
 SETUP_EXAMPLE = {
     "baseline": "",
     "ai_files": [],
@@ -236,7 +242,7 @@ def snapshot(section):
     for pat in ("CLAUDE.md", "CLAUDE.local.md"):
         for p in sorted(sec.rglob(pat)):
             rel = p.relative_to(sec).as_posix()
-            if rel not in files and not rel.startswith((".git/", "node_modules/", ".svn/")):
+            if rel not in files and not rel.startswith(SKIP_DIRS):
                 add_file(p)
     # setup.json ai_files: 프로젝트가 정한 구조 파일 (예: 하위 폴더의 AGENTS.md)
     for g in AI_GLOBS:
@@ -244,7 +250,7 @@ def snapshot(section):
             continue
         for p in sorted(sec.glob(g)):
             rel = p.relative_to(sec).as_posix()
-            if p.is_file() and rel not in files and not rel.startswith((".git/", "node_modules/", ".svn/")):
+            if p.is_file() and rel not in files and not rel.startswith(SKIP_DIRS):
                 add_file(p)
     # CLAUDE.md 등이 @경로 로 불러오는 파일도 구조에 포함 (불러온 파일 안의 @import 도 따라감)
     imports, seen = [], {(sec / f).resolve() for f in files}
@@ -264,8 +270,15 @@ def snapshot(section):
                             "h": hashlib.sha1(data).hexdigest()[:8]})
             if rel not in files:
                 files.append(rel)
+    # apply 로 적용한 구조 묶음의 나머지 파일(도구 등)도 구조 지문에 포함
+    mark = load_json(sec / PROFILE_MARK, {}) or {}
+    for r in mark.get("files", []):
+        p = sec / r
+        if safe_rel(r) and r not in files and p.is_file() and not r.startswith(".claude/"):
+            add_file(p)
+    profile = mark.get("name", "")  # apply 로 적용한 구조 이름
     return {"section": str(sec), "section_name": sec.name, "agents": agents, "skills": skills,
-            "files": files, "plugins": plugins, "imports": imports, "fp": h.hexdigest()[:8]}
+            "files": files, "plugins": plugins, "imports": imports, "profile": profile, "fp": h.hexdigest()[:8]}
 
 
 def md_imports(path, seen, depth=1):
@@ -273,12 +286,23 @@ def md_imports(path, seen, depth=1):
     상대 경로는 그 파일 위치 기준, ~/ 는 홈 폴더. 코드 블록·인라인 코드 안의 @ 는 무시한다."""
     if depth > IMPORT_DEPTH:
         return
+    for _, q in import_tokens(path):
+        if q in seen:
+            continue
+        seen.add(q)
+        yield q
+        yield from md_imports(q, seen, depth + 1)
+
+
+def import_tokens(path):
+    """md 파일이 직접 불러오는 @경로 → [(원문 토큰, 실제 파일 경로)]. 실제 있는 파일만."""
     try:
         txt = Path(path).read_text(encoding="utf-8-sig", errors="ignore")
     except Exception:
-        return
+        return []
     txt = re.sub(r"```.*?```", "", txt, flags=re.S)
     txt = re.sub(r"`[^`\n]*`", "", txt)
+    out = []
     for m in IMPORT_RE.finditer(txt):
         raw = m.group(1).rstrip(".,;:!?")
         q = Path(os.path.expanduser(raw)) if raw.startswith("~") else Path(raw)
@@ -286,13 +310,11 @@ def md_imports(path, seen, depth=1):
             q = Path(path).parent / q
         try:
             q = q.resolve()
-            if not q.is_file() or q in seen:
-                continue
+            if q.is_file():
+                out.append((raw, q))
         except Exception:
             continue
-        seen.add(q)
-        yield q
-        yield from md_imports(q, seen, depth + 1)
+    return out
 
 
 def configure(d):
@@ -313,7 +335,13 @@ def is_ai_path(p):
     p = p.strip().strip('"').replace("\\", "/")
     name = p.rsplit("/", 1)[-1]
     return (p.startswith(AI_PATHS) or "/.claude/" in "/" + p or name in ("CLAUDE.md", "CLAUDE.local.md")
-            or any(glob_match(p, g) for g in AI_GLOBS))
+            or any(glob_match(p, g) for g in AI_GLOBS) or p in PROFILE_FILES)
+
+
+def load_profile_mark(section):
+    """apply 로 적용한 구조 파일 목록을 AI 설정으로 취급 (reset·코드 지문에서 제외)."""
+    PROFILE_FILES.clear()
+    PROFILE_FILES.update(r for r in (load_json(Path(section) / PROFILE_MARK, {}) or {}).get("files", []) if safe_rel(r))
 
 
 def refs_fingerprint(section):
@@ -494,6 +522,288 @@ def reset_code(section, yes):
     print("완료")
 
 
+# ---------------------------------------------------------------- 구조 묶음 (capture / apply)
+def internal_path(q):
+    """섹션 밖 파일을 묶음 안에 둘 경로 (공통 상위 폴더를 못 찾을 때). C:/dev/a.md → .claude/imported/C/dev/a.md"""
+    s = Path(q).as_posix()
+    m = re.match(r"^([A-Za-z]):/(.*)$", s)
+    return f"{INTERNAL_DIR}/{m.group(1).upper()}/{m.group(2)}" if m else f"{INTERNAL_DIR}/{s.lstrip('/')}"
+
+
+def internal_map(paths):
+    """섹션 밖 파일들 → 묶음 안 경로. 공통 상위 폴더 기준으로 짧게 두어(Windows 경로 길이 제한)
+    파일끼리의 상대 @import 는 그대로 유지한다. 예: C:/dev/svn_mini/Document/AGENTS.md → .claude/imported/Document/AGENTS.md"""
+    paths = sorted(set(paths))
+    if not paths:
+        return {}
+    try:
+        root = Path(os.path.commonpath([str(q.parent) for q in paths]))
+    except ValueError:  # 드라이브가 다르면 공통 상위가 없다
+        return {q: internal_path(q) for q in paths}
+    name = root.name or (root.drive.rstrip(":") or "ext")
+    return {q: f"{INTERNAL_DIR}/{name}/{q.relative_to(root).as_posix()}" for q in paths}
+
+
+def compare_hook_entries(cfg):
+    """settings 의 hooks 중 이 도구가 등록한 항목만 {이벤트: [항목]}"""
+    out = {}
+    for ev, lst in ((cfg or {}).get("hooks") or {}).items():
+        mine = [x for x in (lst or []) if "mes_compare" in json.dumps(x, ensure_ascii=False)]
+        if mine:
+            out[ev] = mine
+    return out
+
+
+def strip_compare_hooks(cfg):
+    hooks = cfg.get("hooks")
+    if isinstance(hooks, dict):
+        for ev in list(hooks):
+            lst = [x for x in (hooks[ev] or []) if "mes_compare" not in json.dumps(x, ensure_ascii=False)]
+            if lst:
+                hooks[ev] = lst
+            else:
+                del hooks[ev]
+        if not hooks:
+            del cfg["hooks"]
+    return cfg
+
+
+def safe_rel(p):
+    """묶음·기록 안의 경로가 섹션 밖을 가리키지 않는지 확인."""
+    pp = Path(p)
+    return bool(p) and not pp.is_absolute() and ".." not in pp.parts and not re.match(r"^[A-Za-z]:", p)
+
+
+def tree_files(base, rel_dir=""):
+    root = Path(base) / rel_dir
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            rel = p.relative_to(base).as_posix()
+            if "/__pycache__/" not in "/" + rel and not rel.startswith(SKIP_DIRS):
+                yield rel
+
+
+def unversioned(section):
+    """git/SVN 에 등록되지 않은 경로 (구조 파일 후보)."""
+    kind = vcs(section)
+    if kind == "svn":
+        return [p.replace("\\", "/") for c, p in svn_changes(section) if c == "?"]
+    if kind == "git":
+        top, ch = git_changes(section)
+        try:
+            pre = Path(section).resolve().relative_to(Path(top).resolve()).as_posix() if top else "."
+        except ValueError:
+            pre = "."
+        out = []
+        for xy, p, _ in ch:
+            if xy == "??":
+                if pre not in (".", ""):
+                    if not p.startswith(pre + "/"):
+                        continue
+                    p = p[len(pre) + 1:]
+                out.append(p)
+        return out
+    return []
+
+
+def rewrite_imports(src_path, new_rel, data, outside, out):
+    """복사한 md 안의 '섹션 밖 @경로' 를 묶음 안 복사본을 가리키는 상대 경로로 바꾼다."""
+    if not new_rel.lower().endswith(".md"):
+        return data
+    bom = data.startswith(b"\xef\xbb\xbf")
+    try:
+        txt = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data
+    changed = False
+    for raw, q in import_tokens(src_path):
+        tgt = outside.get(q)
+        if tgt is None:
+            continue
+        relp = os.path.relpath(out / tgt, (out / new_rel).parent).replace("\\", "/")
+        txt = txt.replace("@" + raw, "@" + relp)
+        changed = True
+    if not changed:
+        return data
+    return (b"\xef\xbb\xbf" if bom else b"") + txt.encode("utf-8")
+
+
+def capture_profile(section, out, includes, yes):
+    """섹션의 구조 파일을 경로 그대로 묶음 폴더에 복사한다. 섹션 밖 @import 파일은 묶음 안으로 넣는다."""
+    sec, out = Path(section).resolve(), Path(out).resolve()
+    if out == sec or sec in out.parents:
+        raise ValueError("묶음 폴더는 섹션 밖에 두세요")
+    if out.exists() and any(x.name != ".git" for x in out.iterdir()):
+        if not (out / PROFILE_MANIFEST).is_file():
+            raise ValueError(f"{out} 는 비어 있지 않고 구조 묶음도 아님 (다른 폴더를 지정하세요)")
+        if not yes:
+            raise ValueError(f"{out} 에 이미 구조 묶음이 있음. 덮어쓰려면 --yes")
+    sn = snapshot(sec)
+    inside, missing = set(), []
+    for f in sn["files"]:
+        if not Path(f).is_absolute():
+            inside.add(f)
+    if (sec / ".claude").is_dir():
+        inside.update(r for r in tree_files(sec, ".claude") if not r.endswith(".bak"))
+    for inc in includes:
+        rel = inc.replace("\\", "/").strip("/")
+        p = sec / rel
+        if not safe_rel(rel):
+            raise ValueError(f"--include 는 섹션 안 상대 경로여야 함: {inc}")
+        if p.is_file():
+            inside.add(rel)
+        elif p.is_dir():
+            inside.update(tree_files(sec, rel))
+        else:
+            missing.append(inc)
+    inside = {r for r in inside if not r.startswith(SKIP_DIRS) and r not in (DATA_POINTER, PROFILE_MARK)}
+    outside = internal_map([Path(i["path"]).resolve() for i in sn["imports"] if i.get("outside")])
+
+    if out.exists():  # 이전 묶음 내용 정리 (.git 은 유지)
+        import shutil
+        for x in out.iterdir():
+            if x.name == ".git":
+                continue
+            shutil.rmtree(x) if x.is_dir() else x.unlink()
+    entries = []
+
+    def write(rel, data):
+        dst = out / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+        entries.append({"path": rel, "sha1": hashlib.sha1(data).hexdigest()[:12]})
+
+    for rel in sorted(inside):
+        src = sec / rel
+        data = src.read_bytes()
+        if rel == ".claude/settings.local.json":  # 비교 훅은 섹션마다 다시 설치하므로 묶음에서 뺀다
+            try:
+                cfg = strip_compare_hooks(json.loads(data.decode("utf-8-sig") or "{}"))
+                data = json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+            except Exception:
+                pass
+        write(rel, rewrite_imports(src, rel, data, outside, out))
+    for q, rel in sorted(outside.items()):
+        write(rel, rewrite_imports(q, rel, q.read_bytes(), outside, out))
+    manifest = {"name": out.name, "captured_from": str(sec), "captured_at": now_iso(), "tool_version": VERSION,
+                "agents": sn["agents"], "skills": sn["skills"],
+                "internalized": {q.as_posix(): r for q, r in outside.items()}, "files": entries}
+    (out / PROFILE_MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"구조 묶음: {out}  ·  파일 {len(entries)}개 (섹션 안 {len(inside)} · 섹션 밖 @import {len(outside)})")
+    for q, r in sorted(outside.items()):
+        print(f"  섹션 밖 → 묶음 안: {q.as_posix()} → {r}")
+    for m in missing:
+        print("경고: --include 경로 없음:", m)
+    cands, noise = [], 0
+    for p in unversioned(sec):
+        p = p.rstrip("/")
+        if p in inside or any(r.startswith(p + "/") for r in inside) or p.startswith(SKIP_DIRS) \
+                or p in (DATA_POINTER, PROFILE_MARK):
+            continue
+        if is_build_output(p):  # 빌드 산출물·캐시는 구조 후보가 아니다
+            noise += 1
+            continue
+        cands.append(p)
+    if cands:
+        # 이름이 . 으로 시작하거나 md·toml·json 인 것(규칙·설정일 가능성이 큰 것)을 앞에 보여준다
+        cands.sort(key=lambda p: (not (p.rsplit("/", 1)[-1].startswith(".") or p.lower().endswith((".md", ".toml", ".json"))), p))
+        print(f"참고: 저장소에 등록되지 않은 파일·폴더 {len(cands)}개 — 구조에 필요하면 --include 로 넣으세요"
+              + (f" (빌드 산출물·캐시 {noise}개는 생략)" if noise else ""))
+        for p in cands[:30]:
+            print("   ", p)
+
+
+BUILD_DIRS = {"bin", "obj", ".vs", "packages", "node_modules", "runtimes", "testresults", "__pycache__", ".idea",
+              "debug", "release", "x64", "x86"}
+
+
+def is_build_output(p):
+    parts = [x.lower() for x in p.replace("\\", "/").split("/")]
+    return any(x in BUILD_DIRS for x in parts) or parts[-1].endswith(
+        (".dll", ".pdb", ".exe", ".cache", ".user", ".suo", ".log", ".tmp", ".bak", ".zip"))
+
+
+def apply_profile(section, src):
+    """구조 묶음을 섹션에 적용할 계획 → (이름, 쓸 파일, 지울 파일)."""
+    sec, src = Path(section).resolve(), Path(src).resolve()
+    man = load_json(src / PROFILE_MANIFEST, None)
+    if not isinstance(man, dict):
+        raise ValueError(f"{src} 에 {PROFILE_MANIFEST} 가 없음 (capture 로 만든 구조 묶음을 지정하세요)")
+    # 묶음을 손으로 고쳐 새 구조를 만들 수 있으므로 목록이 아니라 실제 폴더 내용을 적용한다
+    new = [r for r in tree_files(src) if r != PROFILE_MANIFEST]
+    bad = [r for r in new if not safe_rel(r)]
+    if bad:
+        raise ValueError(f"묶음에 섹션 밖을 가리키는 경로가 있음: {bad[:3]}")
+    prev = [r for r in (load_json(sec / PROFILE_MARK, {}) or {}).get("files", []) if safe_rel(r)]
+    drop = [r for r in prev if r not in set(new)]
+    return man.get("name") or src.name, new, drop
+
+
+def do_apply(section, src, yes):
+    sec, src = Path(section).resolve(), Path(src).resolve()
+    name, new, drop = apply_profile(sec, src)
+    over = [r for r in new if (sec / r).exists()]
+    print(f"구조 '{name}' 적용: 쓸 파일 {len(new)}개 (덮어씀 {len(over)}) · 이전 구조에서 지울 파일 {len(drop)}개")
+    for r in new[:30]:
+        print("  쓰기  ", r, "(덮어씀)" if r in over else "")
+    for r in drop[:30]:
+        print("  지우기", r)
+    if not yes:
+        print("미리보기입니다. 실제로 하려면 --yes 를 붙이세요. (바뀌는 파일은 먼저 백업)")
+        return
+    import shutil
+    bdir = sec / PROFILE_BACKUP / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    def backup(r):
+        f = sec / r
+        if f.is_file():
+            (bdir / r).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, bdir / r)
+
+    keep = {}
+    st_p = sec / ".claude" / "settings.local.json"
+    if st_p.is_file():
+        try:
+            keep = compare_hook_entries(json.loads(st_p.read_text(encoding="utf-8-sig") or "{}"))
+        except Exception:
+            keep = {}
+    for r in drop:
+        backup(r)
+        f = sec / r
+        if f.is_file():
+            f.unlink()
+            par = f.parent
+            while par != sec and par.is_dir() and not any(par.iterdir()):
+                par.rmdir()
+                par = par.parent
+    for r in new:
+        backup(r)
+        data = (src / r).read_bytes()
+        if r == ".claude/settings.local.json" and keep:  # 설치돼 있던 비교 훅은 유지
+            try:
+                cfg = json.loads(data.decode("utf-8-sig") or "{}")
+                hooks = cfg.setdefault("hooks", {})
+                for ev, lst in keep.items():
+                    cur = hooks.setdefault(ev, [])
+                    cur.extend(x for x in lst if x not in cur)
+                data = json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+            except Exception:
+                pass
+        dst = sec / r
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+    if keep and ".claude/settings.local.json" not in new:  # 묶음에 설정이 없으면 비교 훅만 남긴 설정을 둔다
+        cfg = {"hooks": keep}
+        st_p.parent.mkdir(parents=True, exist_ok=True)
+        st_p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    (sec / PROFILE_MARK).write_text(json.dumps({"name": name, "source": str(src), "applied_at": now_iso(),
+                                                "files": new}, ensure_ascii=False, indent=1), encoding="utf-8")
+    sn = snapshot(sec)
+    print(f"적용 완료: 구조 {name} · 에이전트 {len(sn['agents'])} · 스킬 {len(sn['skills'])} · 규칙 파일 {len(sn['files'])}"
+          f" · 지문 {sn['fp']}" + (f" · 백업 {bdir}" if bdir.exists() else ""))
+    warn_imports(sn)
+
+
 # ---------------------------------------------------------------- 상태 계산
 def build_state(d):
     d = Path(d)
@@ -605,7 +915,7 @@ def build_state(d):
         for fp in fps[name]:
             sn = snaps.get((name, fp), {})
             c = sconf.get(name, {})
-            structures.append({"key": skey(name, fp), "name": name, "fp": fp, "display": c.get("display", ""),
+            structures.append({"key": skey(name, fp), "name": name, "fp": fp, "display": c.get("display") or (f"구조 {sn['profile']}" if sn.get("profile") else ""),
                                "agents": sn.get("agents", []), "skills": sn.get("skills", []),
                                "files": sn.get("files", []), "plugins": sn.get("plugins", []),
                                "section": sn.get("section_name", ""), "agent_skills": c.get("agent_skills") or {},
@@ -1070,6 +1380,15 @@ def main():
     rs = sub.add_parser("reset", help="AI 설정은 남기고 코드·문서 변경만 되돌림 (기본 미리보기)")
     rs.add_argument("--yes", action="store_true")
     rs.add_argument("--section", default=".")
+    cp = sub.add_parser("capture", help="섹션의 구조 파일을 경로 그대로 구조 묶음 폴더에 담기")
+    cp.add_argument("--out", required=True, help="구조 묶음 폴더 (섹션 밖, 폴더 이름이 구조 이름)")
+    cp.add_argument("--include", action="append", help="자동으로 못 찾는 구조 파일·폴더 (섹션 기준, 여러 번 가능)")
+    cp.add_argument("--section", default=".")
+    cp.add_argument("--yes", action="store_true", help="이미 있는 묶음 덮어쓰기")
+    ap_ = sub.add_parser("apply", help="구조 묶음을 이 섹션에 적용 (기본 미리보기)")
+    ap_.add_argument("profile", help="구조 묶음 폴더")
+    ap_.add_argument("--section", default=".")
+    ap_.add_argument("--yes", action="store_true")
     sub.add_parser("hook")
     v = sub.add_parser("serve")
     v.add_argument("--port", type=int, default=8765)
@@ -1088,8 +1407,17 @@ def main():
         sys.exit(0)
 
     sect = Path(getattr(a, "section", ".") or ".").resolve()
+    if a.cmd == "capture":  # 담기는 기록 폴더가 필요 없으므로 원본 폴더 옆에 기록 폴더를 만들지 않는다
+        if a.dir:
+            configure(a.dir)
+        try:
+            capture_profile(sect, a.out, a.include or [], a.yes)
+        except (ValueError, OSError) as e:
+            sys.exit(str(e))
+        return
     d = get_dir(a.dir, sect)
     configure(d)
+    load_profile_mark(sect)
     if a.cmd == "init":
         if not (d / "setup.json").exists():
             (d / "setup.json").write_text(json.dumps(SETUP_EXAMPLE, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1112,6 +1440,14 @@ def main():
         try:
             reset_code(sect, a.yes)
         except ValueError as e:
+            sys.exit(str(e))
+    elif a.cmd == "apply":
+        cur = current(d)
+        if cur and Path(cur.get("section", "")) == sect:
+            sys.exit(f"진행 중인 실행이 있습니다: {cur['run_id']} (먼저 end)")
+        try:
+            do_apply(sect, a.profile, a.yes)
+        except (ValueError, OSError) as e:
             sys.exit(str(e))
     elif a.cmd == "structure":
         print(json.dumps({"snapshot": snapshot(sect), "code": code_base(sect), "refs": refs_fingerprint(sect), "data_dir": str(d)}, ensure_ascii=False, indent=1))

@@ -124,12 +124,53 @@ python $T build --out 구조비교_1차.html --label "1차"    # 공유용 단�
 | `end` | AI 작업 종료 → 판정 대기 (합격 여부는 넣지 않음) |
 | `judge` | 사람 판정 (`--run` 또는 `--task-id`+`--structure`, 같은 작업 ID가 여러 프로젝트에 있으면 `--project`) |
 | `reset [--yes]` | AI 설정은 두고 코드·문서 변경만 되돌림 (기본 미리보기) |
+| `capture --out <묶음 폴더> [--include 경로]` | 섹션의 구조 파일을 경로 그대로 구조 묶음에 담기 |
+| `apply <묶음 폴더> [--yes]` | 구조 묶음을 섹션에 적용 (기본 미리보기) |
 | `serve` | 실시간 대시보드 |
 | `build` | 단일 HTML 스냅샷 + 경고 출력 |
 | `status` | 텍스트 요약 |
 | `hook` | Claude Code 훅 진입점 (직접 쓰지 않음) |
 
 공통 옵션 `--dir`: 기록 폴더 지정. 기본 순서는 `--dir` → 환경변수 `MES_DIR` → 섹션의 `.mes-dir` → (git) 원본 저장소 `.mes/` → (SVN·기타) 섹션 옆 `mes-compare-data/`.
+
+---
+
+## 구조 묶음: 다른 섹션·다른 PC에 구조 그대로 적용
+
+구조(규칙 MD·에이전트·스킬·설정·도구)를 **구조 묶음** 폴더 하나로 담아 두고, 다른 섹션에서는 명령 하나로 적용합니다. 구조 묶음 폴더들을 비공개 git 저장소에 두면 다른 PC에서도 받아서 그대로 씁니다. 회사 규칙이 들어가므로 **공개 저장소에 올리지 마세요.**
+
+```
+ai-structure-profiles/        ← 비공개 저장소 (예)
+ ├─ 현재/                      ← 구조 묶음 = 섹션과 같은 경로로 파일을 둔 폴더 + profile.json
+ │   ├─ CLAUDE.local.md
+ │   ├─ products/MES/AGENTS.md …
+ │   ├─ .claude/agents, .claude/skills, .claude/settings.local.json
+ │   └─ .claude/imported/…     ← 섹션 밖에서 @import 하던 파일
+ └─ 리뷰/                      ← 현재를 복사해 고친 새 구조
+```
+
+```bash
+# 1) 지금 쓰는 구조 담기 (원본 폴더는 읽기만 함)
+cd <지금 작업 폴더>
+python $T capture --out ../ai-structure-profiles/현재 --include tools/my-tool
+
+# 2) 섹션에 적용 (미리보기 → --yes)
+cd <섹션 폴더>
+python $T apply ../ai-structure-profiles/현재 --yes
+```
+
+`capture`
+- `CLAUDE.md`·`CLAUDE.local.md`, `.claude/` 전체, `.mcp.json`, `ai_files`, `@import` 로 불러오는 파일을 자동으로 담습니다.
+- **섹션 밖 `@import` 파일**은 묶음의 `.claude/imported/` 아래로 넣고, `@경로`를 묶음 안 복사본을 가리키게 바꿉니다. 다른 PC에 같은 경로가 없어도 되고, 구조마다 내용을 달리해도 서로 덮어쓰지 않습니다.
+- 규칙 문장에서만 언급되는 도구·폴더는 자동으로 찾지 못하므로 `--include`로 넣습니다. 도움이 되도록 저장소에 **등록되지 않은 파일·폴더**를 후보로 보여줍니다(빌드 산출물은 생략).
+- `settings.local.json`의 비교 훅은 빼고 담습니다(섹션마다 `init --install-hooks`로 설치).
+- 이미 있는 묶음은 `--yes`일 때만 덮어씁니다.
+
+`apply`
+- 묶음 폴더의 **실제 내용**을 적용합니다. 묶음을 손으로 고쳐 새 구조를 만들어도 됩니다(파일 추가·삭제 포함).
+- 바뀌거나 지워지는 파일은 `.mes-profile-backup/<시각>/`에 먼저 백업합니다.
+- 전에 적용한 구조에만 있던 파일은 지웁니다(구조가 섞이지 않게). 설치된 비교 훅은 유지합니다.
+- 적용한 구조 이름을 `.mes-profile.json`에 남기고, 대시보드의 구조 설명에 표시합니다. 적용한 파일은 구조 파일로 취급돼 `reset`·코드 지문에서 빠집니다.
 
 ---
 
