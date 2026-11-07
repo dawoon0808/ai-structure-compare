@@ -798,6 +798,7 @@ def do_apply(section, src, yes):
         st_p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     (sec / PROFILE_MARK).write_text(json.dumps({"name": name, "source": str(src), "applied_at": now_iso(),
                                                 "files": new}, ensure_ascii=False, indent=1), encoding="utf-8")
+    load_profile_mark(sec)  # 방금 적용한 파일을 구조 파일로 보고 경고를 계산
     sn = snapshot(sec)
     print(f"적용 완료: 구조 {name} · 에이전트 {len(sn['agents'])} · 스킬 {len(sn['skills'])} · 규칙 파일 {len(sn['files'])}"
           f" · 지문 {sn['fp']}" + (f" · 백업 {bdir}" if bdir.exists() else ""))
