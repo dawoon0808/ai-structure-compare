@@ -1,0 +1,9 @@
+{
+  "baseline": "기본",
+  "criteria": { "rate_drop_max": 0, "token_cut_min": 10, "time_cut_min": 0, "min_tasks": 5 },
+  "structures": {
+    "기본": { "display": "공용 규칙·스킬 없음" },
+    "현재": { "display": "지금 쓰는 구성" },
+    "리뷰": { "display": "현재 + 독립 리뷰", "agent_skills": { "검증-담당": "변경검증" } }
+  }
+}

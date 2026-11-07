@@ -1,0 +1,4 @@
+.mes/
+mes-compare-data/
+__pycache__/
+*.pyc
