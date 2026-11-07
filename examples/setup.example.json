@@ -1,5 +1,7 @@
 {
   "baseline": "기본",
+  "ai_files": ["**/AGENTS.md"],
+  "fixed_refs": ["D:/notes/설계 보관함/**/*.md"],
   "criteria": { "rate_drop_max": 0, "token_cut_min": 10, "time_cut_min": 0, "min_tasks": 5 },
   "structures": {
     "기본": { "display": "공용 규칙·스킬 없음" },

@@ -22,6 +22,8 @@
 """
 import argparse
 import datetime as dt
+import fnmatch
+import glob as globlib
 import hashlib
 import json
 import os
@@ -40,8 +42,15 @@ FILE_TOOLS = {"Read": "file_path", "Edit": "file_path", "MultiEdit": "file_path"
               "NotebookEdit": "notebook_path"}
 AI_PATHS = (".claude", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", ".mes")
 DATA_POINTER = ".mes-dir"
+IMPORT_DEPTH = 5  # Claude Code 의 @import 최대 깊이
+IMPORT_RE = re.compile(r"(?<![\w`/@])@((?:~|[A-Za-z]:)?[^\s`'\"<>()\[\]{}]+)")
+# setup.json 에서 읽는 분류 (configure 가 채움)
+AI_GLOBS = []    # ai_files: 섹션 안에서 구조(AI 설정)로 볼 파일 패턴. 예: "**/AGENTS.md"
+FIXED_REFS = []  # fixed_refs: 모든 구조에 같아야 하는 참조 문서 패턴 (섹션 밖 절대 경로 가능)
 SETUP_EXAMPLE = {
     "baseline": "",
+    "ai_files": [],
+    "fixed_refs": [],
     "criteria": {"rate_drop_max": 0, "token_cut_min": 10, "time_cut_min": 0, "min_tasks": 5},
     "structures": {
         "예: B": {"display": "공용 규칙·검색·검증", "agent_skills": {"메인 세션": "통합 검색, 격리 빌드 검증"}}
@@ -224,18 +233,107 @@ def snapshot(section):
             if v:
                 plugins.append(k)
         h.update(json.dumps({k: cfg.get(k) for k in ("enabledPlugins", "permissions", "model")}, sort_keys=True).encode())
-    for p in sorted(sec.rglob("CLAUDE.md")):
-        rel = p.relative_to(sec).as_posix()
-        if rel not in files and not rel.startswith((".git/", "node_modules/")):
-            add_file(p)
+    for pat in ("CLAUDE.md", "CLAUDE.local.md"):
+        for p in sorted(sec.rglob(pat)):
+            rel = p.relative_to(sec).as_posix()
+            if rel not in files and not rel.startswith((".git/", "node_modules/", ".svn/")):
+                add_file(p)
+    # setup.json ai_files: 프로젝트가 정한 구조 파일 (예: 하위 폴더의 AGENTS.md)
+    for g in AI_GLOBS:
+        if Path(g).is_absolute():
+            continue
+        for p in sorted(sec.glob(g)):
+            rel = p.relative_to(sec).as_posix()
+            if p.is_file() and rel not in files and not rel.startswith((".git/", "node_modules/", ".svn/")):
+                add_file(p)
+    # CLAUDE.md 등이 @경로 로 불러오는 파일도 구조에 포함 (불러온 파일 안의 @import 도 따라감)
+    imports, seen = [], {(sec / f).resolve() for f in files}
+    for f in [f for f in files if f.rsplit("/", 1)[-1] in ("CLAUDE.md", "CLAUDE.local.md")]:
+        for q in md_imports(sec / f, seen):
+            try:
+                rel, outside = q.relative_to(sec).as_posix(), False
+            except ValueError:
+                rel, outside = q.as_posix(), True
+            try:
+                data = q.read_bytes()
+            except Exception:
+                continue
+            h.update(rel.encode())
+            h.update(data)
+            imports.append({"path": rel, "from": f, "outside": outside, "ai": outside or is_ai_path(rel),
+                            "h": hashlib.sha1(data).hexdigest()[:8]})
+            if rel not in files:
+                files.append(rel)
     return {"section": str(sec), "section_name": sec.name, "agents": agents, "skills": skills,
-            "files": files, "plugins": plugins, "fp": h.hexdigest()[:8]}
+            "files": files, "plugins": plugins, "imports": imports, "fp": h.hexdigest()[:8]}
+
+
+def md_imports(path, seen, depth=1):
+    """md 파일의 @경로 import 를 따라가며 실제 있는 파일을 돌려준다.
+    상대 경로는 그 파일 위치 기준, ~/ 는 홈 폴더. 코드 블록·인라인 코드 안의 @ 는 무시한다."""
+    if depth > IMPORT_DEPTH:
+        return
+    try:
+        txt = Path(path).read_text(encoding="utf-8-sig", errors="ignore")
+    except Exception:
+        return
+    txt = re.sub(r"```.*?```", "", txt, flags=re.S)
+    txt = re.sub(r"`[^`\n]*`", "", txt)
+    for m in IMPORT_RE.finditer(txt):
+        raw = m.group(1).rstrip(".,;:!?")
+        q = Path(os.path.expanduser(raw)) if raw.startswith("~") else Path(raw)
+        if not q.is_absolute():
+            q = Path(path).parent / q
+        try:
+            q = q.resolve()
+            if not q.is_file() or q in seen:
+                continue
+        except Exception:
+            continue
+        seen.add(q)
+        yield q
+        yield from md_imports(q, seen, depth + 1)
+
+
+def configure(d):
+    """기록 폴더의 setup.json 에서 파일 분류(ai_files, fixed_refs)를 읽는다."""
+    s = load_json(Path(d) / "setup.json", {})
+    if not isinstance(s, dict):
+        return
+    AI_GLOBS[:] = [str(g).replace("\\", "/") for g in (s.get("ai_files") or [])]
+    FIXED_REFS[:] = [str(g).replace("\\", "/") for g in (s.get("fixed_refs") or [])]
+
+
+def glob_match(p, g):
+    # fnmatch 의 * 는 / 도 넘으므로 "**/X" 는 하위 폴더의 X, 앞의 "**/" 를 뗀 "X" 는 최상위 X
+    return fnmatch.fnmatch(p, g) or (g.startswith("**/") and fnmatch.fnmatch(p, g[3:]))
 
 
 def is_ai_path(p):
     p = p.strip().strip('"').replace("\\", "/")
     name = p.rsplit("/", 1)[-1]
-    return p.startswith(AI_PATHS) or "/.claude/" in "/" + p or name in ("CLAUDE.md", "CLAUDE.local.md")
+    return (p.startswith(AI_PATHS) or "/.claude/" in "/" + p or name in ("CLAUDE.md", "CLAUDE.local.md")
+            or any(glob_match(p, g) for g in AI_GLOBS))
+
+
+def refs_fingerprint(section):
+    """setup.json fixed_refs 에 맞는 참조 문서들의 내용 지문. 설정이 없으면 None."""
+    if not FIXED_REFS:
+        return None
+    found = set()
+    for g in FIXED_REFS:
+        pat = g if Path(g).is_absolute() else str(Path(section).resolve() / g)
+        for f in globlib.glob(pat, recursive=True):
+            if os.path.isfile(f):
+                found.add(Path(f).resolve())
+    h = hashlib.sha1()
+    for f in sorted(found):
+        try:
+            h.update(f.as_posix().encode())
+            h.update(f.read_bytes())
+        except Exception:
+            pass
+    return {"fp": h.hexdigest()[:10] if found else "", "n": len(found)}
 
 
 def svn_changes(section):
@@ -429,6 +527,7 @@ def build_state(d):
                 "structure_name": name, "fp": fp, "section": sn.get("section_name", ""),
                 "commit": (ev.get("code") or {}).get("commit", ""), "code_fp": (ev.get("code") or {}).get("code_fp", ""),
                 "dirty_n": (ev.get("code") or {}).get("dirty_n", 0),
+                "refs_fp": (ev.get("refs") or {}).get("fp", ""),
                 "status": "진행 중", "final": "진행 중", "fail_reason": "", "tokens": None, "minutes": None,
                 "rework": 0, "agent": base, "skills": "", "files": "", "agent_skills": [], "agent_files": [],
                 "skill_called": "아니오" if sn.get("skills") else "해당 없음", "review": "해당 없음",
@@ -510,7 +609,7 @@ def build_state(d):
                                "agents": sn.get("agents", []), "skills": sn.get("skills", []),
                                "files": sn.get("files", []), "plugins": sn.get("plugins", []),
                                "section": sn.get("section_name", ""), "agent_skills": c.get("agent_skills") or {},
-                               "versions": len(fps[name])})
+                               "versions": len(fps[name]), "imports": sn.get("imports", [])})
     for (proj, task, sname), ev in plans.items():
         if any(r["project"] == proj and r["task_id"] == task and r["structure_name"] == sname for r in rows.values()):
             continue
@@ -576,7 +675,7 @@ def task_label(r):
 
 def validate(state):
     errs, warns = [], []
-    by_task = {}
+    by_task, by_refs = {}, {}
     for r in state["runs"]:
         k = r["run_id"]
         if r["status"] in ("대기",):
@@ -597,13 +696,48 @@ def validate(state):
             warns.append(f"{k}: 시작 시 코드·문서에 커밋 안 된 변경 {r['dirty_n']}건")
         if r["status"] == "판정 대기":
             warns.append(f"{k}: 사람 판정 대기")
+        by_refs.setdefault(task_label(r), set()).add(r.get("refs_fp") or "")
     for t, cs in by_task.items():
         if len(cs) > 1:
             warns.append(f"{t}: 구조마다 코드·문서가 다름(AI 설정 제외 지문 {sorted(cs)}) → 참조 코드·문서를 같은 커밋으로 맞추세요")
+    for t, cs in by_refs.items():
+        cs.discard("")
+        if len(cs) > 1:
+            warns.append(f"{t}: 고정 참조 문서(fixed_refs)가 실행 사이에 바뀜(지문 {sorted(cs)}) → 비교 도중 참조 문서를 고치지 마세요")
+    changed_names = set()
     for s in state["structures"]:
-        if s["versions"] > 1:
+        if s["versions"] > 1 and s["name"] not in changed_names:  # 버전마다 같은 경고를 반복하지 않음
+            changed_names.add(s["name"])
             warns.append(f"구조 {s['name']}: 비교 도중 구조가 바뀜 → {s['versions']}개 버전으로 나눠 집계")
+        for w in import_warnings(s.get("imports") or []):
+            warns.append(f"구조 {s['key']}: {w}")
+    # 섹션 밖에서 불러오는 규칙이 모든 구조에 똑같으면 구조 차이를 만들지 않는다
+    outs = [{(i["path"], i["h"]) for i in (s.get("imports") or []) if i.get("outside")} for s in state["structures"]]
+    if len(outs) > 1:
+        common = set.intersection(*outs)
+        if common:
+            names = ", ".join(sorted(p for p, _ in common)[:3]) + (" 외" if len(common) > 3 else "")
+            warns.append(f"섹션 밖 공용 규칙 {len(common)}개({names})를 모든 구조가 똑같이 불러옴 → 이 파일들은 구조 차이에 영향 없음")
     return errs, warns
+
+
+def import_warnings(imports):
+    """섹션 안에서 @import 로 불러오지만 AI 설정으로 분류되지 않은 파일 → 코드·문서로 취급되는 문제."""
+    bad = [i["path"] for i in imports if not i.get("outside") and not is_ai_path(i["path"])]
+    if not bad:
+        return []
+    names = ", ".join(bad[:3]) + (" 외" if len(bad) > 3 else "")
+    return [f"@import 로 불러오는 {names} 가 코드·문서로 취급됨 → setup.json ai_files 에 추가하세요"
+            " (구조마다 다르면 코드 지문 경고가 나고 reset 이 되돌림)"]
+
+
+def warn_imports(sn):
+    for w in import_warnings(sn.get("imports") or []):
+        print("경고:", w)
+    outs = [i["path"] for i in (sn.get("imports") or []) if i.get("outside")]
+    if outs:
+        print(f"참고: 섹션 밖 규칙 {len(outs)}개를 불러옴 ({', '.join(outs[:3])}{' 외' if len(outs) > 3 else ''})"
+              " → 모든 구조가 같은 파일을 불러오면 구조 차이에 영향 없음")
 
 
 def render_html(state, live):
@@ -955,6 +1089,7 @@ def main():
 
     sect = Path(getattr(a, "section", ".") or ".").resolve()
     d = get_dir(a.dir, sect)
+    configure(d)
     if a.cmd == "init":
         if not (d / "setup.json").exists():
             (d / "setup.json").write_text(json.dumps(SETUP_EXAMPLE, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -969,6 +1104,7 @@ def main():
             print(f"훅 등록: {p} ({', '.join(added)}) — 이 섹션에서 새로 여는 세션부터 적용")
         sn = snapshot(sect)
         print(f"이 섹션 구조: {sn['section_name']} · 에이전트 {len(sn['agents'])} · 스킬 {len(sn['skills'])} · 규칙 파일 {len(sn['files'])} · 지문 {sn['fp']}")
+        warn_imports(sn)
     elif a.cmd == "reset":
         cur = current(d)
         if cur and Path(cur.get("section", "")) == sect:
@@ -978,7 +1114,7 @@ def main():
         except ValueError as e:
             sys.exit(str(e))
     elif a.cmd == "structure":
-        print(json.dumps({"snapshot": snapshot(sect), "code": code_base(sect), "data_dir": str(d)}, ensure_ascii=False, indent=1))
+        print(json.dumps({"snapshot": snapshot(sect), "code": code_base(sect), "refs": refs_fingerprint(sect), "data_dir": str(d)}, ensure_ascii=False, indent=1))
     elif a.cmd in ("plan", "start"):
         name = a.structure or sect.name
         root = repo_root(sect)
@@ -1000,10 +1136,15 @@ def main():
         rep = len(reps) + 1
         rid = f"{a.task_id}:{name}#{rep}"
         sn, cb = snapshot(sect), code_base(sect)
-        ev = dict(base, type="run_start", run_id=rid, rep=rep, snapshot=sn, code=cb)
+        refs = refs_fingerprint(sect)
+        ev = dict(base, type="run_start", run_id=rid, rep=rep, snapshot=sn, code=cb, refs=refs)
         append(d, ev)
         (d / "current.json").write_text(json.dumps({"run_id": rid, "started": ev["ts"], "section": sn["section"]}, ensure_ascii=False), encoding="utf-8")
-        print(f"시작: {rid} · 구조 {name} (지문 {sn['fp']}) · 코드·문서 지문 {cb['code_fp'] or '없음'} (커밋 {cb['commit'] or '없음'})")
+        print(f"시작: {rid} · 구조 {name} (지문 {sn['fp']}) · 코드·문서 지문 {cb['code_fp'] or '없음'} (커밋 {cb['commit'] or '없음'})"
+              + (f" · 고정 참조 {refs['n']}개 (지문 {refs['fp'] or '없음'})" if refs else ""))
+        if refs is not None and not refs["n"]:
+            print("경고: setup.json fixed_refs 에 맞는 파일이 없음 → 경로·패턴을 확인하세요")
+        warn_imports(sn)
         if cb.get("mixed"):
             print("경고: 작업 폴더에 리비전이 섞여 있음 → svn update 로 한 리비전에 맞추세요")
         if cb["dirty_n"]:
