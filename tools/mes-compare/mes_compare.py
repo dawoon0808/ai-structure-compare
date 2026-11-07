@@ -136,7 +136,8 @@ def get_dir(arg=None, cwd="."):
 
 def load_json(p, default):
     try:
-        return json.loads(Path(p).read_text(encoding="utf-8"))
+        # utf-8-sig: PowerShell 5.1 등이 붙이는 BOM 이 있어도 읽는다
+        return json.loads(Path(p).read_text(encoding="utf-8-sig"))
     except Exception:
         return default
 
@@ -409,7 +410,7 @@ def build_state(d):
         t = ev.get("type")
         rid = ev.get("run_id")
         if t == "plan":
-            plans[(ev["task_id"], ev["structure"])] = ev
+            plans[(ev.get("project", ""), ev["task_id"], ev["structure"])] = ev
             continue
         if t == "run_start":
             sn = ev.get("snapshot") or {}
@@ -510,10 +511,10 @@ def build_state(d):
                                "files": sn.get("files", []), "plugins": sn.get("plugins", []),
                                "section": sn.get("section_name", ""), "agent_skills": c.get("agent_skills") or {},
                                "versions": len(fps[name])})
-    for (task, sname), ev in plans.items():
-        if any(r["task_id"] == task and r["structure_name"] == sname for r in rows.values()):
+    for (proj, task, sname), ev in plans.items():
+        if any(r["project"] == proj and r["task_id"] == task and r["structure_name"] == sname for r in rows.values()):
             continue
-        rid = f"{task}:{sname}#plan"
+        rid = f"{proj}/{task}:{sname}#plan" if proj else f"{task}:{sname}#plan"
         rows[rid] = {"run_id": rid, "rep": 0, "project": ev.get("project", ""), "project_name": ev.get("project_name", ""),
                      "task_id": task, "task": ev.get("task", task), "area": ev.get("area", ""), "risk": ev.get("risk", "일반"),
                      "structure": sname, "structure_name": sname, "fp": "", "section": "", "commit": "", "dirty_n": 0,
@@ -568,6 +569,11 @@ def build_state(d):
             "live": live, "feed": feed, "stale_min": STALE_MIN}
 
 
+def task_label(r):
+    """작업 표시 이름: 프로젝트가 있으면 '프로젝트/작업ID'."""
+    return f"{r['project']}/{r['task_id']}" if r.get("project") else r["task_id"]
+
+
 def validate(state):
     errs, warns = [], []
     by_task = {}
@@ -575,7 +581,8 @@ def validate(state):
         k = r["run_id"]
         if r["status"] in ("대기",):
             continue
-        by_task.setdefault(r["task_id"], set()).add(r.get("code_fp") or r.get("commit") or "?")
+        # 같은 작업 ID 라도 프로젝트가 다르면 다른 작업
+        by_task.setdefault(task_label(r), set()).add(r.get("code_fp") or r.get("commit") or "?")
         if r["status"] == "완료" and r["final"] == "합격":
             for m in ("tokens", "minutes"):
                 if r.get(m) is None:
@@ -664,10 +671,21 @@ def run_hook(dir_arg):
     ev_name, tool, ti = payload.get("hook_event_name", ""), payload.get("tool_name", ""), payload.get("tool_input") or {}
     evs = []
     stack = cur.setdefault("agent_stack", [])
-    who = payload.get("agent_type") or (stack[-1] if stack else None)
     sec = Path(cur.get("section", "")) if cur.get("section") else None
     sid = payload.get("session_id")
     changed = False
+    # 누가 한 일인가: 하위 에이전트 안의 훅 입력에는 agent_id/agent_type 이 들어온다.
+    # 이런 입력을 한 번이라도 받았으면 입력값만 믿는다(없으면 메인 세션). 받은 적이 없는 Claude Code 버전에서만
+    # Agent 호출 스택으로 추정한다 — 호출이 거부·실패해 SubagentStop 이 안 오면 스택이 남으므로 Stop 때 비운다.
+    if payload.get("agent_id") or payload.get("agent_type"):
+        if not cur.get("payload_agents"):
+            cur["payload_agents"] = True
+            changed = True
+    if cur.get("payload_agents"):
+        # 메인 세션도 이름을 명시해야 집계 때 '마지막으로 시작한 에이전트'로 잘못 붙지 않는다
+        who = payload.get("agent_type") or payload.get("agent_id") or MAIN_AGENT
+    else:
+        who = stack[-1] if stack else None
     # 실행을 처음 기록한 세션의 대화 기록 경로를 남겨 end 가 마지막 턴까지 토큰을 직접 계산하게 한다
     # (start~end 를 한 턴에 하면 그 사이에 Stop 훅이 오지 않는다)
     if payload.get("transcript_path") and not cur.get("transcript_path"):
@@ -713,7 +731,20 @@ def run_hook(dir_arg):
                 cur["subagent_tokens"] = subs
                 changed = True
         if ev_name == "SubagentStop" and stack:
-            evs.append({"type": "agent_end", "name": stack.pop()})
+            # 끝난 에이전트 이름이 오면 그 항목을 뺀다 (병렬 실행 시 마지막 항목이 아닐 수 있음)
+            name = payload.get("agent_type")
+            if name in stack:
+                stack.reverse()
+                stack.remove(name)
+                stack.reverse()
+            else:
+                name = stack.pop()
+            evs.append({"type": "agent_end", "name": name})
+            changed = True
+        elif ev_name == "Stop" and stack:
+            # 메인 세션 턴 종료: 끝 신호를 못 받은(거부·실패한) 호출이 남아 있으면 정리
+            evs.append({"type": "agent_end", "name": stack[-1]})
+            stack.clear()
             changed = True
         total = run_tokens(cur)
         if total is not None:
@@ -731,7 +762,16 @@ def run_hook(dir_arg):
 
 def install_hooks(section, data_dir, script):
     cfg_p = Path(section) / ".claude" / "settings.local.json"
-    cfg = load_json(cfg_p, {}) if cfg_p.exists() else {}
+    cfg = {}
+    if cfg_p.exists():
+        # 읽지 못한 설정을 {} 로 보고 덮어쓰면 기존 권한·설정이 사라지므로, 읽기 실패 시 중단한다
+        try:
+            txt = cfg_p.read_text(encoding="utf-8-sig")
+            cfg = json.loads(txt) if txt.strip() else {}
+        except Exception as e:
+            raise ValueError(f"{cfg_p} 를 읽지 못해 훅을 등록하지 않음 (파일은 그대로 둠): {e}")
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("hooks", {}), dict):
+            raise ValueError(f"{cfg_p} 형식이 예상과 달라 훅을 등록하지 않음 (파일은 그대로 둠)")
     cmd = f'"{sys.executable}" "{script}" --dir "{data_dir}" hook'
     hooks = cfg.setdefault("hooks", {})
     added = []
@@ -745,7 +785,7 @@ def install_hooks(section, data_dir, script):
         added.append(event)
     cfg_p.parent.mkdir(parents=True, exist_ok=True)
     if cfg_p.exists():
-        cfg_p.with_suffix(".json.bak").write_text(cfg_p.read_text(encoding="utf-8"), encoding="utf-8")
+        cfg_p.with_suffix(".json.bak").write_bytes(cfg_p.read_bytes())  # 원본 그대로 백업
     cfg_p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     return cfg_p, added
 
@@ -769,11 +809,14 @@ def do_judge(d, run_id, final, reason, by):
     return f"{run_id} → {final}"
 
 
-def find_run(st, run_id=None, task_id=None, structure=None):
+def find_run(st, run_id=None, task_id=None, structure=None, project=None):
     if run_id:
         return run_id
     cands = [r for r in st["runs"] if r["task_id"] == task_id and structure in (r["structure"], r["structure_name"])
-             and r["status"] in ("판정 대기", "완료")]
+             and (not project or r["project"] == project) and r["status"] in ("판정 대기", "완료")]
+    projs = sorted({r["project"] for r in cands})
+    if len(projs) > 1:
+        raise ValueError(f"{task_id}:{structure} 실행이 여러 프로젝트에 있음 ({', '.join(projs)}) → --project 로 지정하세요")
     cands.sort(key=lambda r: (r["status"] != "판정 대기", -r["rep"]))
     if not cands:
         raise ValueError(f"{task_id}:{structure} 판정할 실행이 없음")
@@ -885,6 +928,7 @@ def main():
     j.add_argument("--run", help="실행 ID (예: P1-T01:B#1)")
     j.add_argument("--task-id")
     j.add_argument("--structure")
+    j.add_argument("--project", help="같은 작업 ID 가 여러 프로젝트에 있을 때 지정")
     j.add_argument("--final", required=True, choices=["합격", "불합격"])
     j.add_argument("--fail-reason", default="")
     j.add_argument("--by", required=True)
@@ -918,7 +962,10 @@ def main():
         (sect / DATA_POINTER).write_text(str(d), encoding="utf-8")
         print(f"기록 폴더: {d}  (이 섹션의 {DATA_POINTER} 에 기록 — 섹션들이 같은 폴더를 쓰는지 확인)")
         if a.install_hooks:
-            p, added = install_hooks(sect, d, Path(__file__).resolve())
+            try:
+                p, added = install_hooks(sect, d, Path(__file__).resolve())
+            except ValueError as e:
+                sys.exit(str(e))
             print(f"훅 등록: {p} ({', '.join(added)}) — 이 섹션에서 새로 여는 세션부터 적용")
         sn = snapshot(sect)
         print(f"이 섹션 구조: {sn['section_name']} · 에이전트 {len(sn['agents'])} · 스킬 {len(sn['skills'])} · 규칙 파일 {len(sn['files'])} · 지문 {sn['fp']}")
@@ -985,7 +1032,7 @@ def main():
         print("AI 작업 종료:", cur["run_id"], "→ 사람 판정 대기")
     elif a.cmd == "judge":
         try:
-            rid = find_run(build_state(d), a.run, a.task_id, a.structure)
+            rid = find_run(build_state(d), a.run, a.task_id, a.structure, a.project)
             print("판정:", do_judge(d, rid, a.final, a.fail_reason, a.by))
         except ValueError as e:
             sys.exit(str(e))
@@ -1228,9 +1275,10 @@ const allRuns = () => (S.d.runs || []).filter((r) => (S.project === 'ALL' || r.p
 const runs = () => allRuns().filter((r) => S.risk === 'ALL' || r.risk === S.risk);
 const judged = (r) => r.status === '완료';
 
+const tkey = (r) => `${r.project || ''}::${r.task_id}`; // 같은 작업 ID 라도 프로젝트가 다르면 다른 작업
 function agg(rs) { // task -> structure -> stats
   const T = {};
-  rs.filter((r) => r.status !== '대기').forEach((r) => { ((T[r.task_id] = T[r.task_id] || {})[r.structure] = T[r.task_id][r.structure] || []).push(r); });
+  rs.filter((r) => r.status !== '대기').forEach((r) => { const t = tkey(r); ((T[t] = T[t] || {})[r.structure] = T[t][r.structure] || []).push(r); });
   const st = (list) => {
     const j = list.filter(judged), p = j.filter((r) => r.final === '합격');
     const pm = (f) => { const v = p.map((r) => r[f]).filter((x) => x != null); return v.length ? avg(v) : null; };
@@ -1417,7 +1465,7 @@ function renderDumb() {
 
 function renderTiles() {
   const rs = runs();
-  const T = [['작업', new Set(rs.map((r) => r.task_id)).size], ['실행', rs.filter((r) => r.status !== '대기').length], ['구조', structs().length], ['진행 중', rs.filter((r) => r.status === '진행 중').length, 'hot'],
+  const T = [['작업', new Set(rs.map(tkey)).size], ['실행', rs.filter((r) => r.status !== '대기').length], ['구조', structs().length], ['진행 중', rs.filter((r) => r.status === '진행 중').length, 'hot'],
     ['판정 대기', rs.filter((r) => r.status === '판정 대기').length, 'hot'], ['스킬 미호출', rs.filter((r) => r.skill_called === '아니오' && r.status !== '진행 중').length, 'bad'],
     ['경고', rs.filter((r) => r.wrong_section || r.sessions > 1 || r.dirty_n).length, 'bad'], ['총 토큰', rs.reduce((s, r) => s + (r.tokens || 0), 0)]];
   $('#tiles').replaceChildren(...T.map(([k, v, c]) => el('div', { class: 'tile' + (c && v > 0 ? ' ' + c : '') }, el('div', { class: 'v' }, nf(v)), el('div', { class: 'k' }, k))));
