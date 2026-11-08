@@ -946,8 +946,10 @@ def struct_graph(section, listed):
     cl = sec / ".claude"
     if cl.is_dir():
         for p in cl.rglob("*"):
+            # .claude 안의 숨김 폴더(.verify 등)는 도구가 세션마다 남기는 상태·캐시라 구조가 아니다
+            hidden = any(x.startswith(".") for x in p.relative_to(cl).parts[:-1])
             if p.is_file() and p.suffix.lower() in SG_EXT and not {"imported", "__pycache__"} & set(p.parts) \
-                    and p.name not in ("settings.local.json", "검증결과.md") and not p.name.endswith(".bak"):
+                    and not hidden and p.name not in ("settings.local.json", "검증결과.md") and not p.name.endswith(".bak"):
                 rels.add(p.relative_to(sec).as_posix())
     rels = sorted(rels)[:300]
     sig = tuple((r, (sec / r).stat().st_mtime if (sec / r).exists() else 0) for r in rels)
