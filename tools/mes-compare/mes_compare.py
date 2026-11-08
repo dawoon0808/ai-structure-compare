@@ -159,14 +159,86 @@ def load_json(p, default):
         return default
 
 
+class events_lock:
+    """events.jsonl 쓰기 잠금. 여러 섹션의 훅이 동시에 쓰면 긴 줄이 서로 섞여 깨지므로 잠금 파일로 순서를 맞춘다."""
+
+    def __init__(self, d):
+        self.p = Path(d) / "events.lock"
+
+    def __enter__(self):
+        import time
+        self.f = open(self.p, "a+b")
+        for _ in range(400):  # 최대 약 20초
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                time.sleep(0.05)
+        return self  # 잠금을 못 얻어도 기록은 남긴다
+
+    def __exit__(self, *a):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.f.seek(0)
+                msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        self.f.close()
+
+
 def append(d, ev):
     ev.setdefault("ts", now_iso())
-    with open(Path(d) / "events.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    line = (json.dumps(ev, ensure_ascii=False) + chr(10)).encode("utf-8")
+    with events_lock(d):
+        with open(Path(d) / "events.jsonl", "ab") as f:
+            f.write(line)  # 한 번에 쓴다
 
 
-def current(d):
-    return load_json(Path(d) / "current.json", None)
+def cur_key(sect):
+    """섹션별 진행 중 실행 파일 이름에 쓰는 짧은 키 (섹션마다 실행을 따로 둬 여러 섹션을 동시에 돌릴 수 있게)."""
+    import hashlib
+    return hashlib.sha1(str(Path(sect).resolve()).lower().encode("utf-8")).hexdigest()[:10]
+
+
+def cur_path(d, sect):
+    return Path(d) / f"current-{cur_key(sect)}.json"
+
+
+def current_all(d):
+    """진행 중인 실행 전부 (섹션별 파일 + 예전 단일 파일)."""
+    out = []
+    for p in sorted(Path(d).glob("current-*.json")) + [Path(d) / "current.json"]:
+        c = load_json(p, None)
+        if c:
+            c["_path"] = str(p)
+            out.append(c)
+    return out
+
+
+def current(d, sect=None):
+    """sect 를 주면 그 섹션의 진행 중 실행, 없으면 첫 번째 것."""
+    for c in current_all(d):
+        if sect is None:
+            return c
+        try:
+            Path(sect).resolve().relative_to(Path(c.get("section") or "").resolve())  # 섹션 안 하위 폴더도 같은 섹션
+            return c
+        except ValueError:
+            continue
+    return None
+
+
+def save_current(cur):
+    p = Path(cur.pop("_path"))
+    p.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+    cur["_path"] = str(p)
 
 
 def read_events(d):
@@ -1129,13 +1201,13 @@ def build_state(d, detail=False):
 
     if detail:
         try:
-            cur_live = current(d)
+            lives = {c.get("run_id"): c for c in current_all(d)}
         except Exception:
-            cur_live = None
+            lives = {}
         for rid, r in rows.items():
             x = extra.get(rid)
             if x and r["status"] != "대기":
-                r["tok"] = run_detail(r, x.get("scount") or {}, cur_live)
+                r["tok"] = run_detail(r, x.get("scount") or {}, lives.get(rid))
 
     base = setup.get("baseline") or ""
     keys = [s["key"] for s in structures]
@@ -1495,7 +1567,20 @@ def run_hook(dir_arg):
         return
     cwd = Path(payload.get("cwd") or ".")
     d = get_dir(dir_arg, cwd)
-    cur = current(d)
+    sid0 = payload.get("session_id")
+    lives = current_all(d)
+    # 1) 이 세션이 시작한 실행  2) 세션이 정해지지 않은(수동 start) 실행 중 cwd 가 그 섹션 안인 것
+    cur = next((c for c in lives if sid0 and c.get("session") == sid0), None)
+    if cur is None:
+        for c in lives:
+            if c.get("session"):
+                continue  # 다른 세션이 맡은 실행에는 기록하지 않는다
+            try:
+                cwd.resolve().relative_to(Path(c.get("section") or ""))
+                cur = c
+                break
+            except Exception:
+                continue
     if not cur:
         return
     ev_name, tool, ti = payload.get("hook_event_name", ""), payload.get("tool_name", ""), payload.get("tool_input") or {}
@@ -1599,7 +1684,7 @@ def run_hook(dir_arg):
         if total is not None:
             evs.append({"type": "tokens", "total": total})
     if changed:
-        (d / "current.json").write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+        save_current(cur)
     for ev in evs:
         ev["run_id"] = cur["run_id"]
         if sid:
@@ -1839,16 +1924,16 @@ def main():
         print(f"이 섹션 구조: {sn['section_name']} · 에이전트 {len(sn['agents'])} · 스킬 {len(sn['skills'])} · 규칙 파일 {len(sn['files'])} · 지문 {sn['fp']}")
         warn_imports(sn)
     elif a.cmd == "reset":
-        cur = current(d)
-        if cur and Path(cur.get("section", "")) == sect:
+        cur = current(d, sect)
+        if cur:
             sys.exit(f"진행 중인 실행이 있습니다: {cur['run_id']} (먼저 end)")
         try:
             reset_code(sect, a.yes)
         except ValueError as e:
             sys.exit(str(e))
     elif a.cmd == "apply":
-        cur = current(d)
-        if cur and Path(cur.get("section", "")) == sect:
+        cur = current(d, sect)
+        if cur:
             sys.exit(f"진행 중인 실행이 있습니다: {cur['run_id']} (먼저 end)")
         try:
             do_apply(sect, a.profile, a.yes)
@@ -1870,9 +1955,9 @@ def main():
             append(d, dict(base, type="plan"))
             print("계획:", a.task_id, name)
             return
-        cur = current(d)
+        cur = current(d, sect)
         if cur:
-            sys.exit(f"이미 진행 중: {cur['run_id']} (먼저 end)")
+            sys.exit(f"이 섹션에서 이미 진행 중: {cur['run_id']} (먼저 end)")
         reps = [x for x in read_events(d) if x.get("type") == "run_start" and x.get("task_id") == a.task_id and x.get("structure") == name]
         rep = len(reps) + 1
         rid = f"{a.task_id}:{name}#{rep}"
@@ -1880,7 +1965,7 @@ def main():
         refs = refs_fingerprint(sect)
         ev = dict(base, type="run_start", run_id=rid, rep=rep, snapshot=sn, code=cb, refs=refs)
         append(d, ev)
-        (d / "current.json").write_text(json.dumps({"run_id": rid, "started": ev["ts"], "section": sn["section"]}, ensure_ascii=False), encoding="utf-8")
+        cur_path(d, sn["section"]).write_text(json.dumps({"run_id": rid, "started": ev["ts"], "section": sn["section"]}, ensure_ascii=False), encoding="utf-8")
         print(f"시작: {rid} · 구조 {name} (지문 {sn['fp']}) · 코드·문서 지문 {cb['code_fp'] or '없음'} (커밋 {cb['commit'] or '없음'})"
               + (f" · 고정 참조 {refs['n']}개 (지문 {refs['fp'] or '없음'})" if refs else ""))
         if refs is not None and not refs["n"]:
@@ -1891,7 +1976,7 @@ def main():
         if cb["dirty_n"]:
             print(f"경고: 코드·문서에 커밋 안 된 변경 {cb['dirty_n']}건 → 구조끼리 참조 코드가 달라질 수 있음")
     elif a.cmd == "event":
-        cur = current(d) or sys.exit("진행 중인 실행이 없습니다")
+        cur = current(d, sect) or sys.exit("이 섹션에 진행 중인 실행이 없습니다")
         ev = {"type": a.type, "run_id": cur["run_id"]}
         for k in ("name", "total", "agent"):
             if getattr(a, k) is not None:
@@ -1900,7 +1985,7 @@ def main():
             ev["review"] = True
         append(d, ev)
     elif a.cmd == "end":
-        cur = current(d) or sys.exit("진행 중인 실행이 없습니다")
+        cur = current(d, sect) or sys.exit("이 섹션에 진행 중인 실행이 없습니다")
         ev = {"type": "run_end", "run_id": cur["run_id"]}
         for k in ("checks_passed", "checks_total", "rework", "tokens", "minutes", "note"):
             if getattr(a, k) is not None:
@@ -1910,7 +1995,7 @@ def main():
             if t is not None:
                 ev["tokens"] = t
         append(d, ev)
-        (d / "current.json").unlink()
+        Path(cur["_path"]).unlink()
         print("AI 작업 종료:", cur["run_id"], "→ 사람 판정 대기")
     elif a.cmd == "judge":
         try:

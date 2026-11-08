@@ -151,6 +151,12 @@ def clean_prompt(p):
     return " ".join(p.split())
 
 
+def _cur_key(sec):
+    """mes_compare.cur_key 와 같은 규칙: 섹션마다 진행 중 실행·자동 상태 파일을 따로 둔다."""
+    import hashlib
+    return hashlib.sha1(str(Path(sec).resolve()).lower().encode("utf-8")).hexdigest()[:10]
+
+
 def auto_hook():
     payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace") or "{}")
     cwd = Path(payload.get("cwd") or ".").resolve()
@@ -167,8 +173,9 @@ def auto_hook():
             fh.write(f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}\n")
 
     event, sid = payload.get("hook_event_name", ""), payload.get("session_id", "")
-    cur = _load(d / "current.json")
-    st = _load(d / AUTO_STATE, {}) or {}
+    cur_p, st_p = d / f"current-{_cur_key(sec)}.json", d / f"auto-state-{_cur_key(sec)}.json"
+    cur = _load(cur_p)
+    st = _load(st_p, {}) or {}
     mine = bool(cur and st.get("run_id") == cur.get("run_id"))  # 자동으로 시작한 실행인가 (mc start 로 시작한 것은 건드리지 않음)
 
     if event == "SessionEnd":
@@ -199,13 +206,13 @@ def auto_hook():
                         "--structure", structure_name(sec)], cwd=str(sec), capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     log(f"자동 시작 ({sec}): {r.stdout.strip() or r.stderr.strip()}")
-    cur = _load(d / "current.json")
+    cur = _load(cur_p)
     if r.returncode == 0 and cur:
         if payload.get("transcript_path"):
             cur["transcript_path"] = payload["transcript_path"]
-            (d / "current.json").write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
-        (d / AUTO_STATE).write_text(json.dumps({"run_id": cur["run_id"], "session": sid}, ensure_ascii=False),
-                                    encoding="utf-8")
+        cur["session"] = sid  # 기록 훅이 이 세션의 입력만 이 실행에 붙인다 (다른 세션 기록 섞임 방지)
+        cur_p.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+        st_p.write_text(json.dumps({"run_id": cur["run_id"], "session": sid}, ensure_ascii=False), encoding="utf-8")
 
 
 # ---------------------------------------------------------------- 안전 차단 (PreToolUse 훅)
@@ -404,8 +411,9 @@ def do_check():
         probs, nm = check_section(sec, c.get("data_dir"))
         bad += bool(probs)
         print(f"  {'✓' if not probs else '✗'} {nm:<8} {s}" + "".join(f"\n      {p}" for p in probs))
-    cur = _load(Path(c.get("data_dir") or ".") / "current.json")
-    print(f"진행 중인 실행: {cur['run_id']}" if cur else "진행 중인 실행: 없음")
+    lives = [(_load(p) or {}).get("run_id") for p in sorted(Path(c.get("data_dir") or ".").glob("current*.json"))]
+    lives = [x for x in lives if x]
+    print(f"진행 중인 실행: {', '.join(lives)}" if lives else "진행 중인 실행: 없음")
     print(f"대시보드: {'켜져 있음' if port_open() else '꺼져 있음 (mc dash)'}")
     print("문제 없음" if not bad else "→ 문제가 있는 섹션은 mc setup 을 다시 실행하세요")
     return 1 if bad else 0
