@@ -41,6 +41,8 @@ REVIEW_HINTS = ("review", "리뷰", "검증", "reviewer", "verif")
 FILE_TOOLS = {"Read": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "Write": "file_path",
               "NotebookEdit": "notebook_path"}
 AI_PATHS = (".claude", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", ".mes")
+# 명령 문자열 안의 파일 경로 (따옴표 안 공백 경로 포함). 확장자가 있는 것만
+CMD_PATH_RE = re.compile(r"\"[^\"\n]+?\.[A-Za-z0-9]{1,6}\"|'[^'\n]+?\.[A-Za-z0-9]{1,6}'|(?:[A-Za-z]:)?[\w.\-/\\가-힣~]+\.[A-Za-z0-9]{1,6}\b")
 DATA_POINTER = ".mes-dir"
 PROFILE_MARK = ".mes-profile.json"      # 섹션에 적용한 구조 기록
 PROFILE_BACKUP = ".mes-profile-backup"  # 구조 적용 전 백업
@@ -970,7 +972,7 @@ def build_state(d, detail=False):
                 "checks_passed": None, "checks_total": ev.get("checks_total"), "judged_by": "", "judged_at": "",
                 "ai_note": "", "sessions": 0, "wrong_section": False, "started": ev["ts"], "ended": ""}
             extra[rid] = {"last_ts": ev["ts"], "skills": [], "files": [], "agents": [base], "tokens": None,
-                          "skill": None, "file": None, "agent": base, "base": base, "sessions": set()}
+                          "skill": None, "file": None, "agent": base, "base": base, "sessions": set(), "recent": []}
             continue
         if rid not in rows:
             continue
@@ -986,6 +988,9 @@ def build_state(d, detail=False):
             sc = x.setdefault("scount", {})
             sc[ev["session"]] = sc.get(ev["session"], 0) + 1
         who = ev.get("agent") or x["agent"] or x["base"]
+        if t in ("skill", "file", "agent"):
+            key = {"skill": "sk:", "file": "fi:", "agent": "ag:"}[t] + str(ev.get("name", ""))
+            x["recent"] = [k for k in x["recent"] if k != key][-11:] + [key]  # 최근에 쓴 것 12개
         if t == "skill":
             x["skill"] = ev["name"]
             if ev["name"] not in x["skills"]:
@@ -1074,7 +1079,7 @@ def build_state(d, detail=False):
                      "structure": r["structure"], "section": r["section"], "agent": x["agent"], "skill": x["skill"],
                      "file": x["file"], "started": r["started"], "last_ts": x["last_ts"], "tokens": x["tokens"],
                      "skills_n": len(x["skills"]), "files_n": len(x["files"]), "sessions": r["sessions"],
-                     "wrong_section": r["wrong_section"],
+                     "wrong_section": r["wrong_section"], "recent": x["recent"],
                      "stale": bool(lt and (now - lt).total_seconds() > STALE_MIN * 60)})
 
     sname_of = {rid: r["structure"] for rid, r in rows.items()}
@@ -1535,6 +1540,25 @@ def run_hook(dir_arg):
             except Exception:
                 pass
             evs.append({"type": "file", "name": p.as_posix() if isinstance(p, Path) else str(p), "agent": who})
+        elif tool in ("Bash", "PowerShell") and ti.get("command"):
+            # 명령(cat·sed·grep·Get-Content 등)으로 읽은 파일도 기록: 명령 안의 경로 중 실제로 있는 파일만
+            seen_p = set()
+            for m in CMD_PATH_RE.finditer(str(ti["command"])):
+                raw = m.group(0).strip("'\"")
+                try:
+                    q = Path(raw.replace("\\", "/"))
+                    q = (q if q.is_absolute() else cwd / q).resolve()
+                    if not q.is_file():
+                        continue
+                    name = q.relative_to(sec).as_posix() if sec else q.as_posix()
+                except Exception:
+                    try:
+                        name = q.as_posix()
+                    except Exception:
+                        continue
+                if name not in seen_p and len(seen_p) < 20:
+                    seen_p.add(name)
+                    evs.append({"type": "file", "name": name, "agent": who})
         elif tool in ("Task", "Agent"):
             n = str(ti.get("subagent_type") or ti.get("description") or "하위 에이전트")
             ev = {"type": "agent", "name": n}
@@ -2007,7 +2031,8 @@ table.tt th{text-align:left;color:var(--mut);font-weight:500;padding:4px 8px;bor
 table.tt td.n,table.tt th.n{text-align:right}table.tt td:nth-child(2),table.tt td.n{white-space:nowrap}table.tt .f{font-family:ui-monospace,Consolas,monospace;font-size:11px;overflow-wrap:anywhere}
 .stars{display:block;width:100%;background:radial-gradient(ellipse at center,#120d0b 0%,#07080c 70%);border-radius:var(--r);cursor:default}
 .zoom3{display:flex;gap:6px;margin-top:-44px;margin-left:10px;position:relative;width:max-content}.leg3{margin-top:18px}.leg3 .legend i{display:inline-block;margin-right:5px;vertical-align:-1px}
-.g3wrap{position:relative}.g3panel{position:absolute;left:10px;top:34px;background:rgba(10,12,18,.72);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:8px 10px;font-size:12px;min-width:12.5rem}
+.g3wrap{position:relative}.g3live{position:absolute;right:10px;top:34px;max-width:min(30rem,55%);background:rgba(10,12,18,.8);border:1px solid rgba(120,220,150,.35);border-radius:8px;padding:7px 10px;font-size:12px;line-height:1.5}
+.g3live.stale{border-color:rgba(240,180,90,.45)}.g3lt{font-weight:600;color:var(--ok)}.g3live.stale .g3lt{color:#f0b45a}.g3lt i{display:inline-block;width:8px;height:8px;border-radius:50%;background:currentColor;margin-right:6px;animation:pulse 1.6s infinite}.g3panel{position:absolute;left:10px;top:34px;background:rgba(10,12,18,.72);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:8px 10px;font-size:12px;min-width:12.5rem}
 .g3ph{color:var(--mut);font-size:11px;margin-bottom:4px}.g3row{display:grid;grid-template-columns:16px 1fr auto auto;gap:6px;align-items:center;padding:3px 4px;border-radius:5px;cursor:pointer}.g3row:hover,.g3row.on{background:rgba(255,255,255,.07)}
 .g3row b{font-weight:600;font-variant-numeric:tabular-nums}.g3row small{color:var(--mut);font-size:10.5px}.g3pf{color:var(--mut);font-size:10.5px;margin-top:6px;max-width:13rem}
 .g3head{position:absolute;left:12px;top:8px;right:12px;color:#c9bfb6;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.seg button[disabled]{opacity:.45;cursor:default}
@@ -2531,12 +2556,13 @@ function buildStruct3(k, mr, live) {
     const auto = /^(\.claude\/)?CLAUDE(\.local)?\.md$/.test(gn.id) || (s.imports || []).some((im) => im.path === gn.id);
     const runs = auto ? new Set(mr.map((r) => r.run_id)) : (gn.kind === '스킬' ? sk.get(gn.label) : gn.kind === '에이전트' ? ag.get(gn.label) : null) || reads.get(gn.id) || new Set();
     return { id: gn.id, kind: gn.kind, label: gn.label, path: gn.id, desc: gn.desc || '', colr: KCOL[gn.kind] || '#c7cbe0', runs, used: runs.size > 0, auto, nb: new Set(), deg: 0,
-      hot: hot.some((x) => (gn.kind === '스킬' && x.skill === gn.label) || (gn.kind === '에이전트' && x.agent === gn.label) || x.file === gn.id) };
+      hot: hot.some((x) => { const rc = x.recent || [x.skill && 'sk:' + x.skill, x.agent && 'ag:' + x.agent, x.file && 'fi:' + x.file];
+        return rc.includes(gn.kind === '스킬' ? 'sk:' + gn.label : gn.kind === '에이전트' ? 'ag:' + gn.label : 'fi:' + gn.id); }) };
   });
   const by = new Map(N.map((n) => [n.id, n])), E = [];
   gr.edges.forEach(([a, b]) => { const A = by.get(a), B = by.get(b); if (A && B && A !== B) { E.push({ a: A, b: B, ref: true }); A.nb.add(B); B.nb.add(A); A.deg++; B.deg++; } });
   const root = by.get('CLAUDE.md') || by.get('.claude/CLAUDE.md') || { id: '#root', kind: '지침', label: sLabel(k), path: '', desc: '', colr: KCOL['지침'], runs: new Set(), used: true, nb: new Set(), deg: 0 };
-  root.root = true; if (!by.has(root.id)) N.push(root);
+  root.root = true; root.hot = hot.length > 0; if (!by.has(root.id)) N.push(root);
   // 종류별 공
   const groups = KIND_ORDER.map((kd) => ({ kd, list: N.filter((n) => n.kind === kd && n !== root).sort((a, b) => b.deg - a.deg || a.label.localeCompare(b.label)) })).filter((gp) => gp.list.length);
   const rb = (n) => 26 + 11 * Math.sqrt(n);
@@ -2557,7 +2583,7 @@ function buildStruct3(k, mr, live) {
     });
     E.push({ a: root, b: gp.hub, trunk: true }); root.nb.add(gp.hub); gp.hub.nb.add(root);
   });
-  return { k, N, E, root, groups, ringR, by };
+  return { k, N, E, root, groups, ringR, by, hot };
 }
 let g3open = null;
 function renderForce3D(box, keys, run, rs, live) {
@@ -2585,6 +2611,14 @@ function renderForce3D(box, keys, run, rs, live) {
     el('div', { class: 'g3pf' }, `밝음 = ${run ? '이 실행에서' : `실행 ${mr.length}건에서`} 읽거나 부름 · 흐림 = 안 씀`));
   const head = el('div', { class: 'g3head' }, `${sLabel(k)} · ${root.id === '#root' ? '시작 파일 없음' : root.label + ' 기준'} · ` + groups.map((gp) => `${gp.kd} ${gp.list.length}`).join(' · '));
   wrap.append(panel, head);
+  // 진행 중 표시: 구조 파일을 안 쓰는 동안에도 지금 무엇을 하는지 보이게
+  G.hot.forEach((x) => { const ago = x.last_ts ? Math.max(0, Math.round((Date.now() - new Date(x.last_ts)) / 1000)) : null;
+    const rc = (x.recent || []).slice().reverse(), used = rc.filter((key) => G.by.has(key.slice(3)) || N.some((n) => (n.kind === '스킬' && 'sk:' + n.label === key) || (n.kind === '에이전트' && 'ag:' + n.label === key)));
+    const nm = (key) => key.startsWith('fi:') ? short(key.slice(3)) : key.slice(3);
+    wrap.append(el('div', { class: 'g3live' + (x.stale ? ' stale' : '') },
+      el('div', { class: 'g3lt' }, el('i', {}), `${x.stale ? '멈춤 의심' : '작업 중'} · ${runName(x.run_id)}${ago != null ? ` · ${ago < 90 ? ago + '초' : Math.round(ago / 60) + '분'} 전` : ''}`),
+      el('div', {}, `지금: ${x.agent && x.agent !== '메인 세션' ? x.agent + ' · ' : ''}${rc[0] ? nm(rc[0]) : '시작하는 중'}`),
+      el('div', { class: 'mut' }, used.length ? `최근 쓴 구조: ${used.slice(0, 4).map(nm).join(', ')} (깜빡임)` : groups.length ? '최근에는 구조 파일 없이 코드만 읽는 중' : '이 구조에는 구조 파일이 없음 · 코드만 읽는 중'))); });
   let ay = S.g3 ? S.g3.ay : 0, ax = S.g3 ? S.g3.ax : 0, uz = S.g3 ? S.g3.uz : 1, pan = S.g3 ? S.g3.pan : [0, 0], drag = null, hover = null, t0 = performance.now();
   let sel = (S.pick && G.by.get(S.pick)) || null;
   const maxR = Math.max(...groups.map((gp) => gp.r), 30), fitZ = Math.min(W - 200, H) * .47 / (G.ringR + maxR + 20);

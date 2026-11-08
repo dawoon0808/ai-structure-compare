@@ -185,7 +185,11 @@ def auto_hook():
             log(f"건너뜀: 수동으로 시작한 실행 {cur.get('run_id')} 진행 중")
             return
         if st.get("session") == sid:
-            return  # 같은 세션의 이어지는 입력
+            # 같은 세션의 이어지는 입력. 다른 세션이 보낸 새 과제(cross-session-message)만 새 실행으로 나눈다.
+            order, desc, _ = read_tasks(data_dir)
+            cur_task = desc.get(str(cur.get("run_id", "")).split(":")[0])
+            if "<cross-session-message" not in (payload.get("prompt") or "") or prompt[:300] == cur_task:
+                return
         _auto_end(Path(cur.get("section") or sec), data_dir, cur, log)
     task = prompt[:300]
     order, desc, _ = read_tasks(data_dir)
@@ -219,6 +223,9 @@ GUARD_RULES = [
     (r"[\\/]bin[\\/](?!(msbuild|vswhere|csc|vbc)\.exe)[^\s\"']*\.exe", "빌드된 MES 프로그램 실행 (DB 접속 가능)"),
     (r"start-process", "외부 프로그램 실행"),
 ]
+# DB 쓰기·실행으로 보는 말 (하나라도 있으면 조회로 보지 않음)
+DB_WRITE = (r"\b(insert|update|delete|merge|upsert|drop|alter|create|truncate|rename|grant|revoke|deny|exec|execute|call|begin\s+tran"
+            r"|commit|rollback|into|bulk|executenonquery|executescalar\s*\(\s*\)\s*;?\s*$|sp_\w+|xp_\w+|dbms_\w+|lock\s+table|for\s+update)\b")
 
 
 def guard_hook():
@@ -229,8 +236,11 @@ def guard_hook():
     low = cmd.lower()
     for pat, why in GUARD_RULES:
         if re.search(pat, low):
-            sys.stderr.write(f"비교 테스트 규칙으로 차단됨: {why}. 이 테스트에서는 SVN 명령과 DB 접속·변경을 할 수 없습니다. "
-                             "코드와 문서 파일만 읽고 고치세요.\n")
+            # DB 는 조회(SELECT)만 허용: 명령에 조회문이 있고 쓰기·실행 문장이 하나도 없으면 통과
+            if why.startswith("DB") and re.search(r"\bselect\b", low) and not re.search(DB_WRITE, low):
+                continue
+            sys.stderr.write(f"비교 테스트 규칙으로 차단됨: {why}. 이 테스트에서는 SVN 명령과 DB 변경을 할 수 없습니다 "
+                             "(DB 는 SELECT 조회만 가능, INSERT·UPDATE·DELETE·EXEC·프로시저 호출 등은 불가).\n")
             try:
                 cwd = Path(payload.get("cwd") or ".").resolve()
                 sec = next((q for q in [cwd, *cwd.parents] if (q / ".mes-dir").is_file()), None)
