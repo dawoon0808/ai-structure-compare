@@ -42,7 +42,40 @@ git·SVN 모두 지원합니다. 서버(git 원격·SVN)에 아무것도 올리�
 
 ---
 
-## 설치
+## 설치 — 가장 쉬운 방법 (플러그인)
+
+**1. PC에 한 번 설치**
+```bash
+git clone https://github.com/dawoon0808/ai-structure-compare.git
+```
+```bash
+ai-structure-compare\install.cmd
+```
+- 설치되는 것: 스킬, `aicompare` 명령, 기록·차단 훅.
+- 준비물: Python 3.8 이상. claude CLI를 못 찾으면 앱 입력창에서 직접 설치합니다.
+  ```
+  /plugin marketplace add <clone 경로>
+  /plugin install mes-compare@mes-compare
+  ```
+
+**2. 비교 폴더 만들기**
+같은 코드를 폴더별로 받아 비교 폴더 아래에 나란히 둡니다(예: `D:/compare/새구조`, `D:/compare/현재`). 폴더 이름이 구조 이름이 됩니다.
+
+**3. 연결 (한 번)**
+Claude Code에서 섹션 하나를 열고 **"비교 시작해줘"**라고 합니다. 비교 폴더와 섹션 목록을 보여 주고, 확인을 받은 뒤 표시합니다(`aicompare root --yes`).
+
+**4. 그다음은 그냥 작업**
+- 각 섹션에서 새 세션을 열고 작업을 시키면 자동으로 시작·기록·종료됩니다.
+- 대시보드는 자동으로 켜집니다. 다시 열 때는 `aicompare dash`를 씁니다.
+- 섹션을 더 만들려면 비교 폴더 아래에 폴더만 추가하면 됩니다.
+
+**동작 범위**
+- 훅은 비교 폴더(`.mes-compare` 표시) 안에서만 동작합니다. 그 밖의 프로젝트에는 기록도 차단도 없습니다.
+- 비교 폴더 안에서는 SVN 명령과 DB 변경이 차단됩니다(SELECT 조회는 허용).
+- 비교 폴더가 여러 개면 대시보드도 기록 폴더마다 다른 포트(8765, 8766, …)로 켜집니다.
+- 업데이트: `git pull` → `install.cmd`를 실행하고 새 세션을 엽니다. 제거: `install.cmd -Uninstall`(기록은 남습니다).
+
+## 설치 — 직접 하는 방법 (섹션마다 훅)
 
 ### 1. 도구 두기
 `tools/mes-compare/mes_compare.py`를 내 컴퓨터 아무 폴더에 둡니다. 예: `D:\tools\mes-compare\mes_compare.py`
@@ -54,15 +87,15 @@ git·SVN 모두 지원합니다. 서버(git 원격·SVN)에 아무것도 올리�
   프로젝트 안의 `.claude/skills/`에는 넣지 마세요. 섹션 구조의 일부가 되어 비교를 흐립니다.
 - **Claude 앱**: 스킬 화면에서 `SKILL.md`를 업로드합니다.
 
-### 3. 기록 훅 — 가장 쉬운 방법 (`mc`)
+### 3. 기록 훅 (`aicompare setup`)
 섹션 폴더들을 준비한 뒤 명령 세 줄이면 됩니다.
 ```bash
-python tools/mes-compare/mc.py install          # mc 명령 등록 (한 번만)
-mc setup D:/compare/섹션1=새구조 D:/compare/섹션2=현재 D:/compare/섹션3=구조없음
-mc dash                                          # 대시보드를 켜고 브라우저까지 엶
+python tools/mes-compare/mc.py install          # aicompare 명령 등록 (한 번만)
+aicompare setup D:/compare/섹션1=새구조 D:/compare/섹션2=현재 D:/compare/섹션3=구조없음
+aicompare dash                                    # 대시보드를 켜고 브라우저까지 엶
 ```
-- `mc setup` 이 섹션마다 한 번에 하는 일: 기록 폴더 연결(기본 = 섹션들의 공통 상위/`mes-compare-data`), 구조 이름 저장, 기록 훅(파일·스킬·에이전트·토큰), **자동 시작·종료 훅**(작업을 그냥 시키면 실행이 자동으로 시작·종료되어 `mc start`/`mc end` 불필요), SVN·DB 접속 차단 훅(`--no-guard` 로 끔). 결과를 섹션별 ✓/✗ 로 보여 줍니다.
-- `mc check`: 연결한 섹션마다 훅·기록 폴더·구조 이름 점검, 진행 중 실행·대시보드 상태.
+- `aicompare setup` 이 섹션마다 한 번에 하는 일: 기록 폴더 연결(기본 = 섹션들의 공통 상위/`mes-compare-data`), 구조 이름 저장, 기록 훅(파일·스킬·에이전트·토큰), **자동 시작·종료 훅**(작업을 그냥 시키면 실행이 자동으로 시작·종료되어 `aicompare start`·`end` 불필요), SVN·DB 접속 차단 훅(`--no-guard` 로 끔). 결과를 섹션별 ✓/✗ 로 보여 줍니다.
+- `aicompare check`: 연결한 섹션마다 훅·기록 폴더·구조 이름 점검, 진행 중 실행·대시보드 상태.
 - 훅은 섹션의 `.claude/settings.local.json`(개인 설정)에 들어가고, 이전 파일은 `.json.bak` 으로 남습니다. 섹션에서 **새로 여는** 세션부터 적용됩니다.
 
 직접 하려면 섹션마다 `init --install-hooks`를 실행합니다 (기록 훅만 등록, 자동 시작·종료는 없음).
@@ -115,7 +148,7 @@ python $T reset            # 다음 작업 전 코드 되돌리기 (미리보기
 
 ### 판정과 보기
 ```bash
-python $T serve            # http://localhost:8765 실시간 대시보드 (판정 입력 가능) — mc dash 와 같음
+python $T serve            # http://localhost:8765 실시간 대시보드 (판정 입력 가능) — aicompare dash 와 같음
 # 대시보드: 구조별 비교(기준 구조 값 포함) · 토큰은 어디에 쓰였나(접힘: 기본 문맥·이전 작업 이월·파일 읽기·명령 등 용도별, 실행별 상위 항목)
 #           · 작업 흐름 3D 연결(실행마다 읽은 파일·도구 호출이 둥근 덩어리, 확대·회전) · 에이전트·스킬 설명(접힘)
 python $T judge --run T01:기본#1 --final 불합격 --fail-reason "재고 원복 누락" --by 홍길동

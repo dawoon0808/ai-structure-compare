@@ -1,0 +1,6 @@
+{
+  "name": "mes-compare",
+  "owner": {"name": "dawoon0808"},
+  "description": "AI 사용 구조 비교 도구",
+  "plugins": [{"name": "mes-compare", "source": "./", "description": "AI 사용 구조 비교 (자동 감지·기록·대시보드)", "version": "0.1.1"}]
+}
